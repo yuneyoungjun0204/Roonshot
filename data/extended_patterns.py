@@ -164,39 +164,90 @@ def generate_scattered(
     center: Tuple[float, float] = DEFENSE_CENTER,
     spawn_radius: float = SPAWN_RADIUS_BASE,
     speed: float = ENEMY_SPEED,
+    num_directions: int = 3,
+    direction_spread_deg: float = None,
+    cluster_spread_deg: float = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Generate DIVERSIONARY formation: wide angles, irregular arrival times.
+    Generate DIVERSIONARY formation: 3 clustered groups from 3 directions (~120° apart).
 
-    Enemies come from random directions with diverse distances/speeds.
+    Each direction has a small cluster of 3-4 ships approaching together.
+    This simulates a coordinated multi-directional attack.
+
+    Visual shape:
+      - Direction 1 (0°)   : 3-4 ships clustered together
+      - Direction 2 (120°) : 3-4 ships clustered together
+      - Direction 3 (240°) : 3-4 ships clustered together
+
+    Args:
+        num_enemies: total number of enemies (distributed across directions)
+        center: defense center
+        spawn_radius: base spawn distance
+        speed: approach speed
+        num_directions: number of attack directions (default: 3)
+        direction_spread_deg: randomization in direction angles (default: 10-30°)
+        cluster_spread_deg: spread within each cluster (default: 8-15°)
     """
+    if direction_spread_deg is None:
+        direction_spread_deg = random.uniform(10.0, 30.0)
+    if cluster_spread_deg is None:
+        cluster_spread_deg = random.uniform(8.0, 15.0)
+
+    # Base angles: 120° apart (360° / 3 = 120°)
+    base_angle_offset = random.uniform(0, 2 * math.pi)  # Random rotation
+    direction_angles = []
+    for i in range(num_directions):
+        base_angle = base_angle_offset + (2 * math.pi * i / num_directions)
+        # Add some randomization to direction (±direction_spread_deg/2)
+        angle_jitter = math.radians(random.uniform(-direction_spread_deg/2, direction_spread_deg/2))
+        direction_angles.append(base_angle + angle_jitter)
+
+    # Distribute enemies across directions (3-4 per direction typically)
+    enemies_per_direction = num_enemies // num_directions
+    remainder = num_enemies % num_directions
+
     positions = []
     velocities = []
 
-    for _ in range(num_enemies):
-        angle = random.uniform(0, 2 * math.pi)
-        dist = spawn_radius + random.uniform(-1500, 2000)  # wide distance variation
-        dist = max(1000, dist)  # at least 1km from center
+    cluster_spread_rad = math.radians(cluster_spread_deg) / 2
 
-        x = _clamp(center[0] + dist * math.cos(angle))
-        y = _clamp(center[1] + dist * math.sin(angle))
+    for dir_idx, dir_angle in enumerate(direction_angles):
+        # Number of enemies in this direction
+        n_in_cluster = enemies_per_direction + (1 if dir_idx < remainder else 0)
 
-        # Velocity toward center with larger perturbation
-        dx = center[0] - x
-        dy = center[1] - y
-        d = math.sqrt(dx * dx + dy * dy)
-        if d > 0.1:
-            s = speed * random.uniform(0.5, 1.2)  # wide speed variation
-            # Add heading offset to make it less direct
-            offset = random.uniform(-0.3, 0.3)
-            heading = math.atan2(dy, dx) + offset
-            vx = s * math.cos(heading)
-            vy = s * math.sin(heading)
-        else:
-            vx, vy = 0.0, 0.0
+        # Distance variation for this cluster (slight layering within cluster)
+        cluster_base_dist = spawn_radius + random.uniform(-500, 500)
 
-        positions.append([x, y])
-        velocities.append([vx, vy])
+        for i in range(n_in_cluster):
+            # Spread ships within the cluster (lateral spread)
+            if n_in_cluster > 1:
+                frac = i / (n_in_cluster - 1) - 0.5  # -0.5 to +0.5
+                lateral_offset = frac * 2 * cluster_spread_rad
+            else:
+                lateral_offset = 0.0
+
+            angle = dir_angle + lateral_offset
+            angle += random.uniform(-0.03, 0.03)  # tiny jitter
+
+            # Slight distance variation within cluster
+            dist = cluster_base_dist + random.uniform(-200, 300)
+
+            x = _clamp(center[0] + dist * math.cos(angle))
+            y = _clamp(center[1] + dist * math.sin(angle))
+
+            # Velocity toward center
+            dx = center[0] - x
+            dy = center[1] - y
+            d = math.sqrt(dx * dx + dy * dy)
+            if d > 0.1:
+                s = speed * random.uniform(0.9, 1.1)
+                vx = (dx / d) * s
+                vy = (dy / d) * s
+            else:
+                vx, vy = 0.0, 0.0
+
+            positions.append([x, y])
+            velocities.append([vx, vy])
 
     return np.array(positions), np.array(velocities)
 

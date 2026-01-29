@@ -91,17 +91,44 @@ CLASSIFIER_OUTPUT_DIM = 3  # CONCENTRATED (집중), WAVE (파상), DIVERSIONARY 
 # Training hyperparameters
 LEARNING_RATE = 1e-3
 BATCH_SIZE = 64
-MAX_EPOCHS = 200
-EARLY_STOPPING_PATIENCE = 15
+MAX_EPOCHS = 500                  # Increased from 200 for better convergence
+EARLY_STOPPING_PATIENCE = 40     # Increased from 15 to allow more exploration
 
 # Confidence threshold for rule-based fallback
 CONFIDENCE_THRESHOLD = 0.6
 
 # =============================================================================
+# MISSED ENEMY DETECTION
+# =============================================================================
+MISSED_THRESHOLD = 100.0  # meters - enemy must be this much closer to mothership than pair to be "missed"
+
+# =============================================================================
+# ESCAPED ENEMY DETECTION
+# =============================================================================
+# An enemy is "escaped" from its cluster if it moves beyond this distance from the cluster center
+ESCAPE_DISTANCE_THRESHOLD = 800.0  # meters - distance from cluster center to be considered "escaped"
+
+# =============================================================================
+# PAIR RETURN TO HOME
+# =============================================================================
+# Virtual cluster ID to indicate "returning to home position" state
+RETURNING_HOME_CLUSTER_ID = -99999  # Special marker for returning state
+HOME_ARRIVAL_THRESHOLD = 50.0  # meters - distance to home position to be considered "arrived"
+
+# =============================================================================
+# DATA AUGMENTATION
+# =============================================================================
+AUGMENT_NOISE_STD = 0.05          # Gaussian noise std (fraction of feature std)
+AUGMENT_TEMPORAL_STEPS = 3        # Number of temporal snapshots around lock point
+AUGMENT_TEMPORAL_RANGE = 20       # Simulation steps before/after lock (±20 steps)
+AUGMENT_ROTATION_ENABLED = True   # Enable random rotation augmentation
+AUGMENT_SCALE_RANGE = (0.9, 1.1)  # Scale factor range for position augmentation
+
+# =============================================================================
 # DATA GENERATION
 # =============================================================================
-ENEMY_SPEED = 50.0           # m/s
-FRIENDLY_SPEED = 25.0        # m/s
+ENEMY_SPEED = 100.0          # m/s (3x increased)
+FRIENDLY_SPEED = 50.0        # m/s (3x increased)
 SPAWN_RADIUS_BASE = 7500.0   # meters from center (CONCENTRATED / DIVERSIONARY) — matches simulator safe_zone_radii[-1]+500
 WAVE_SPAWN_RADIUS = 7000.0   # meters from center (WAVE 1st wave) — matches simulator hardcoded value
 DT = 0.05                    # simulation timestep

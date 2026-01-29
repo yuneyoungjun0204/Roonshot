@@ -8,6 +8,7 @@ import sys
 import os
 import numpy as np
 from pathlib import Path
+from typing import Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -24,9 +25,52 @@ from ml.constants import (
     MAX_EPOCHS,
     EARLY_STOPPING_PATIENCE,
     NUM_FEATURES,
+    AUGMENT_NOISE_STD,
 )
 from ml.labels import FormationClass
 from ml.classifier import FormationClassifier, save_classifier
+
+
+def augment_features(X: np.ndarray, y: np.ndarray, noise_std: float = AUGMENT_NOISE_STD) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Apply data augmentation to training features.
+
+    Augmentation techniques:
+    1. Gaussian noise injection
+    2. Feature-wise scaling perturbation
+
+    Args:
+        X: (N, 19) feature array
+        y: (N,) label array
+        noise_std: Standard deviation for Gaussian noise (as fraction of feature std)
+
+    Returns:
+        Augmented (X_aug, y_aug) with ~2x original size
+    """
+    n_samples, n_features = X.shape
+
+    # Original data
+    X_list = [X]
+    y_list = [y]
+
+    # 1. Gaussian noise augmentation
+    feature_stds = np.std(X, axis=0) + 1e-8  # Avoid division by zero
+    noise = np.random.randn(n_samples, n_features) * feature_stds * noise_std
+    X_noisy = X + noise
+    X_list.append(X_noisy)
+    y_list.append(y.copy())
+
+    # 2. Small scaling perturbation (simulate measurement uncertainty)
+    scale_factors = np.random.uniform(0.95, 1.05, size=(n_samples, n_features))
+    X_scaled = X * scale_factors
+    X_list.append(X_scaled)
+    y_list.append(y.copy())
+
+    # Combine
+    X_aug = np.vstack(X_list).astype(np.float32)
+    y_aug = np.concatenate(y_list).astype(np.int64)
+
+    return X_aug, y_aug
 
 
 def load_dataset(path: str = "data/training_data/formation_tensors.pt"):
@@ -79,6 +123,11 @@ def train_classifier(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
+    # Data augmentation (only on training set)
+    print(f"Before augmentation: {X_train.shape[0]} training samples")
+    X_train, y_train = augment_features(X_train, y_train)
+    print(f"After augmentation: {X_train.shape[0]} training samples (3x)")
+
     # Standardize
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train).astype(np.float32)
@@ -106,6 +155,11 @@ def train_classifier(
     model = FormationClassifier().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss()
+
+    # Learning rate scheduler: reduce LR when validation loss plateaus
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=10, min_lr=1e-6, verbose=True
+    )
 
     # Training loop with early stopping
     best_val_acc = 0.0
@@ -162,6 +216,9 @@ def train_classifier(
                 f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f} | "
                 f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}"
             )
+
+        # Learning rate scheduler step
+        scheduler.step(val_acc)
 
         # Early stopping
         if val_acc > best_val_acc:

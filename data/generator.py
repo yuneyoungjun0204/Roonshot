@@ -29,6 +29,8 @@ from ml.constants import (
     NUM_FEATURES,
     FEATURE_NAMES,
     FORMATION_LOCK_RADIUS,
+    AUGMENT_TEMPORAL_STEPS,
+    AUGMENT_TEMPORAL_RANGE,
 )
 from ml.labels import FormationClass, auto_label_snapshot
 from ml.features import FeatureExtractor
@@ -93,6 +95,7 @@ def generate_5km_entry_samples(
     enemies_range: Tuple[int, int] = (5, 15),
     lock_radius: float = FORMATION_LOCK_RADIUS,
     max_sim_steps: int = 5000,
+    temporal_augment: bool = True,
 ) -> List[Tuple[np.ndarray, int]]:
     """
     Generate labeled feature vectors at the 5km boundary crossing moment.
@@ -100,7 +103,7 @@ def generate_5km_entry_samples(
     For each scenario:
       1. Spawn enemies outside the lock radius
       2. Simulate until the first enemy crosses 5km
-      3. Take ONE snapshot at that exact moment
+      3. Take multiple snapshots around that moment (temporal augmentation)
       4. Extract features and assign label
 
     Args:
@@ -110,6 +113,7 @@ def generate_5km_entry_samples(
         enemies_range: (min, max) enemies per scenario
         lock_radius: radius at which to capture snapshot (5000m)
         max_sim_steps: safety limit to prevent infinite loops
+        temporal_augment: if True, capture multiple snapshots around lock moment
 
     Returns:
         List of (feature_vector_19d, label) tuples
@@ -125,29 +129,64 @@ def generate_5km_entry_samples(
 
         # Fast-forward until first enemy enters 5km radius
         crossed = False
-        for _ in range(max_sim_steps):
+        steps_to_lock = 0
+        for step in range(max_sim_steps):
             if sim.any_within_radius(lock_radius):
                 crossed = True
+                steps_to_lock = step
                 break
             sim.step(1)
 
         if not crossed:
             continue
 
-        # Take snapshot at this exact moment
-        snap_pos, snap_vel = sim.snapshot()
+        # === TEMPORAL AUGMENTATION ===
+        # Capture snapshots at different time points around the lock moment
+        if temporal_augment:
+            # Go back to capture "before lock" snapshots
+            time_offsets = []
+            for i in range(AUGMENT_TEMPORAL_STEPS):
+                # Spread snapshots: -RANGE, 0, +RANGE (approximately)
+                offset = int((i - AUGMENT_TEMPORAL_STEPS // 2) * (AUGMENT_TEMPORAL_RANGE // max(1, AUGMENT_TEMPORAL_STEPS - 1)))
+                time_offsets.append(offset)
 
-        # Only use active enemies (not yet at center)
-        mask = sim.get_active_mask()
-        if np.sum(mask) < 3:
-            continue
+            for offset in time_offsets:
+                # Re-simulate to the target time point
+                sim_copy = HeadlessSimulation(pos.copy(), vel.copy())
+                target_step = max(0, steps_to_lock + offset)
 
-        active_pos = snap_pos[mask]
-        active_vel = snap_vel[mask]
+                # Fast forward to target step
+                if target_step > 0:
+                    sim_copy.step(target_step)
 
-        features = extractor.extract(active_pos, active_vel)
-        if features is not None:
-            samples.append((features, label))
+                # Take snapshot
+                snap_pos, snap_vel = sim_copy.snapshot()
+
+                # Only use active enemies (not yet at center)
+                mask = sim_copy.get_active_mask()
+                if np.sum(mask) < 3:
+                    continue
+
+                active_pos = snap_pos[mask]
+                active_vel = snap_vel[mask]
+
+                features = extractor.extract(active_pos, active_vel)
+                if features is not None:
+                    samples.append((features, label))
+        else:
+            # Original behavior: single snapshot at lock moment
+            snap_pos, snap_vel = sim.snapshot()
+
+            mask = sim.get_active_mask()
+            if np.sum(mask) < 3:
+                continue
+
+            active_pos = snap_pos[mask]
+            active_vel = snap_vel[mask]
+
+            features = extractor.extract(active_pos, active_vel)
+            if features is not None:
+                samples.append((features, label))
 
     return samples
 

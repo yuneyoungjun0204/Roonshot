@@ -44,8 +44,8 @@ CONFIG = {
     "ui_bg_color": (25, 25, 40, 200),
 
     # USV Parameters
-    "friendly_speed": 25.0,  # m/s
-    "enemy_speed": 50.0,  # m/s (high-speed threat)
+    "friendly_speed": 75.0,  # m/s (3x increased)
+    "enemy_speed": 150.0,  # m/s (high-speed threat, 3x increased)
     "capture_distance": 15.0,  # meters - net capture threshold
     "net_max_length": 200.0,  # meters - maximum net extension
 

@@ -39,7 +39,10 @@ from usv_simulator import (
 # Import ML system
 from ml.inference import DefenseMLSystem
 from ml.labels import FormationClass, FORMATION_NAMES
-from ml.constants import DEFENSE_CENTER, NET_SPACING_BASE
+from ml.constants import (
+    DEFENSE_CENTER, NET_SPACING_BASE, MISSED_THRESHOLD, ESCAPE_DISTANCE_THRESHOLD,
+    RETURNING_HOME_CLUSTER_ID, HOME_ARRIVAL_THRESHOLD,
+)
 
 # Import LLM Commander
 from ml.llm_commander import LLMCommander, rule_based_mapping, get_tactical_command
@@ -451,6 +454,10 @@ class MLSimulation:
         self._missed_enemies: set = set()  # Enemy IDs that have "passed" their assigned pair
         self._reserve_pairs: set = set()  # Pair indices that are in reserve (no cluster assigned)
 
+        # Home positions for return after capture
+        self._pair_home_positions: Dict[int, Tuple[Tuple[float, float], Tuple[float, float]]] = {}
+        # pair_idx -> ((f1_x, f1_y), (f2_x, f2_y))
+
         # ML state for rendering
         self._cluster_labels = np.array([])
         self._formation_name = "UNKNOWN"
@@ -537,6 +544,10 @@ class MLSimulation:
             f2.vx, f2.vy = 0.0, 0.0
 
             self.friendlies.extend([f1, f2])
+
+            # Save home positions for return after capture
+            self._pair_home_positions[pair_idx] = ((f1.x, f1.y), (f2.x, f2.y))
+
             usv_id += 2
 
         # Initialize enemies (same as original)
@@ -670,33 +681,42 @@ class MLSimulation:
                 (target_enemy.y - mothership_pos[1])**2
             )
 
-            # Enemy is closer to mothership than the pair = MISSED
-            if enemy_dist < pair_dist:
+            # Enemy is closer to mothership than the pair by THRESHOLD = MISSED
+            # This means the enemy has "passed" the pair and is now between the pair and mothership
+            if enemy_dist < pair_dist - MISSED_THRESHOLD:
                 newly_missed.append((pair_idx, target_enemy))
                 self._missed_enemies.add(target_enemy.id)
-                print(f"[MISSED] Enemy {target_enemy.id} passed Pair {pair_idx}! "
-                      f"(enemy_dist={enemy_dist:.0f} < pair_dist={pair_dist:.0f})")
+                print(f"[MISSED] Enemy {target_enemy.id} passed Pair {pair_idx}!")
+                print(f"         enemy_dist={enemy_dist:.0f}m < pair_dist={pair_dist:.0f}m - {MISSED_THRESHOLD}m threshold")
+                print(f"         Enemy pos: ({target_enemy.x:.0f}, {target_enemy.y:.0f})")
+                print(f"         Pair center: ({pair_center_x:.0f}, {pair_center_y:.0f})")
 
         if not newly_missed:
             return
 
-        # Find reserve pairs (pairs with no assignment or completed mission)
+        # Collect pair indices that just missed their targets (exclude from reserve candidates)
+        pairs_that_missed = {orig_pair_idx for orig_pair_idx, _ in newly_missed}
+
+        # Find TRUE reserve pairs (pairs that were NEVER assigned to a cluster)
         reserve_pairs = []
         for pair_idx, (f1, f2) in enumerate(pairs):
-            assigned_cluster = self._pair_assignments.get(pair_idx)
-            current_target = self._pair_targets.get(pair_idx)
+            # Skip pairs that just missed - they shouldn't be reassigned to the same enemy
+            if pair_idx in pairs_that_missed:
+                continue
 
-            # Reserve conditions:
-            # 1. No cluster assigned (true reserve)
-            # 2. Cluster assigned but no current target (mission complete)
-            if assigned_cluster is None or current_target is None:
+            assigned_cluster = self._pair_assignments.get(pair_idx)
+
+            # TRUE RESERVE: Only pairs with NO cluster assignment at all
+            # Pairs with cluster assignment but no target are NOT reserve - they're waiting for new enemies in their cluster
+            if assigned_cluster is None:
                 reserve_pairs.append(pair_idx)
 
         if not reserve_pairs:
             print(f"[MISSED] No reserve pairs available for {len(newly_missed)} missed enemies!")
+            print(f"[MISSED] All pair assignments: {self._pair_assignments}")
             return
 
-        print(f"[REASSIGN] {len(newly_missed)} missed enemies, {len(reserve_pairs)} reserve pairs available")
+        print(f"[REASSIGN] {len(newly_missed)} missed enemies, {len(reserve_pairs)} TRUE reserve pairs: {reserve_pairs}")
 
         # Optimal reassignment using effective distance
         for orig_pair_idx, missed_enemy in newly_missed:
@@ -743,8 +763,158 @@ class MLSimulation:
                 virtual_cluster_id = -1 * missed_enemy.id
                 self._pair_assignments[best_pair_idx] = virtual_cluster_id
 
-                print(f"[REASSIGN] Pair {best_pair_idx} -> Enemy {missed_enemy.id} "
-                      f"(cost={best_cost:.1f}, was reserve)")
+                f1_res, f2_res = pairs[best_pair_idx]
+                res_center = ((f1_res.x + f2_res.x) / 2, (f1_res.y + f2_res.y) / 2)
+                print(f"[REASSIGN] Reserve Pair {best_pair_idx} DEPLOYED -> Enemy {missed_enemy.id}")
+                print(f"           Pair {best_pair_idx} pos: ({res_center[0]:.0f}, {res_center[1]:.0f})")
+                print(f"           Enemy {missed_enemy.id} pos: ({missed_enemy.x:.0f}, {missed_enemy.y:.0f})")
+                print(f"           Effective distance cost: {best_cost:.1f}")
+
+    def _remove_enemy_from_cluster(self, enemy_id: int) -> int:
+        """
+        Remove an enemy from its cluster membership.
+
+        Called when:
+          1. Enemy is captured (neutralized)
+          2. Enemy has escaped from its cluster
+
+        Args:
+            enemy_id: ID of the enemy to remove
+
+        Returns:
+            cluster_id the enemy was removed from, or -1 if not found
+        """
+        for cluster_id, enemy_ids in self._cluster_enemy_ids.items():
+            if enemy_id in enemy_ids:
+                enemy_ids.discard(enemy_id)
+                print(f"[CLUSTER] Enemy {enemy_id} removed from Cluster {cluster_id}")
+                print(f"          Cluster {cluster_id} remaining members: {sorted(enemy_ids)}")
+                return cluster_id
+        return -1
+
+    def _check_escaped_enemies(self, pairs: List[Tuple[USV, USV]]):
+        """
+        Check if any enemies have escaped from their assigned cluster.
+
+        An enemy is considered "escaped" if:
+          - Distance from cluster center > ESCAPE_DISTANCE_THRESHOLD
+          - Enemy is still active
+
+        Escaped enemies are:
+          1. Removed from cluster membership
+          2. Reassigned to the closest available pair (reserve or pair that finished its target)
+        """
+        if not self._cluster_centers or not self._cluster_enemy_ids:
+            return
+
+        escaped_enemies = []
+
+        for cluster_id, enemy_ids in list(self._cluster_enemy_ids.items()):
+            if cluster_id not in self._cluster_centers:
+                continue
+
+            cluster_center = self._cluster_centers[cluster_id]
+
+            for enemy_id in list(enemy_ids):  # Copy to avoid modification during iteration
+                # Find the enemy object
+                enemy = next((e for e in self.enemies if e.id == enemy_id), None)
+                if enemy is None or not enemy.is_active:
+                    continue
+
+                # Calculate distance from cluster center
+                dist_to_center = math.sqrt(
+                    (enemy.x - cluster_center[0])**2 +
+                    (enemy.y - cluster_center[1])**2
+                )
+
+                # Check if escaped
+                if dist_to_center > ESCAPE_DISTANCE_THRESHOLD:
+                    escaped_enemies.append((enemy, cluster_id))
+                    print(f"[ESCAPED] Enemy {enemy.id} escaped from Cluster {cluster_id}!")
+                    print(f"          Distance to cluster center: {dist_to_center:.0f}m > {ESCAPE_DISTANCE_THRESHOLD}m threshold")
+                    print(f"          Enemy pos: ({enemy.x:.0f}, {enemy.y:.0f})")
+                    print(f"          Cluster center: ({cluster_center[0]:.0f}, {cluster_center[1]:.0f})")
+
+        if not escaped_enemies:
+            return
+
+        # Remove escaped enemies from their clusters
+        for enemy, old_cluster_id in escaped_enemies:
+            self._remove_enemy_from_cluster(enemy.id)
+
+        # Find available pairs to chase escaped enemies
+        # Available = reserve (no assignment) OR finished their target (target dead/captured)
+        available_pairs = []
+        for pair_idx, (f1, f2) in enumerate(pairs):
+            assigned_cluster = self._pair_assignments.get(pair_idx)
+            current_target = self._pair_targets.get(pair_idx)
+
+            # Reserve pair (never assigned)
+            if assigned_cluster is None:
+                available_pairs.append(pair_idx)
+            # Pair that finished its target (target is dead/captured)
+            elif current_target is None or not current_target.is_active:
+                # Check if the pair is NOT already targeting an escaped enemy (negative cluster_id)
+                if assigned_cluster >= 0:  # Only regular clusters, not virtual ones
+                    available_pairs.append(pair_idx)
+
+        if not available_pairs:
+            print(f"[ESCAPED] No available pairs for {len(escaped_enemies)} escaped enemies!")
+            return
+
+        print(f"[ESCAPED] {len(escaped_enemies)} escaped enemies, {len(available_pairs)} available pairs: {available_pairs}")
+
+        # Assign escaped enemies to available pairs using effective distance
+        for enemy, old_cluster_id in escaped_enemies:
+            if not available_pairs:
+                print(f"[ESCAPED] No more pairs for Enemy {enemy.id}")
+                break
+
+            # Skip if enemy is already targeted
+            if enemy.id in self._targeted_enemies:
+                continue
+
+            # Find the best pair for this escaped enemy
+            best_pair_idx = None
+            best_cost = float('inf')
+
+            for pair_idx in available_pairs:
+                f1, f2 = pairs[pair_idx]
+                pair_center = ((f1.x + f2.x) / 2, (f1.y + f2.y) / 2)
+                pair_heading = math.degrees(f1.heading)
+
+                from ml.ortools_assignment import calculate_effective_distance
+                eff_dist = calculate_effective_distance(
+                    pair_center, pair_heading,
+                    (enemy.x, enemy.y),
+                    angle_weight=1.5
+                )
+
+                if eff_dist < best_cost:
+                    best_cost = eff_dist
+                    best_pair_idx = pair_idx
+
+            if best_pair_idx is not None:
+                # Clear old target assignment if exists
+                old_target = self._pair_targets.get(best_pair_idx)
+                if old_target and old_target.id in self._targeted_enemies:
+                    self._targeted_enemies.discard(old_target.id)
+
+                # Assign escaped enemy to this pair
+                self._pair_targets[best_pair_idx] = enemy
+                self._targeted_enemies.add(enemy.id)
+                available_pairs.remove(best_pair_idx)
+
+                # Use negative cluster ID to indicate "escaped enemy assignment"
+                virtual_cluster_id = -2 * enemy.id  # -2x to distinguish from missed (-1x)
+                self._pair_assignments[best_pair_idx] = virtual_cluster_id
+
+                f1, f2 = pairs[best_pair_idx]
+                pair_center = ((f1.x + f2.x) / 2, (f1.y + f2.y) / 2)
+                print(f"[ESCAPED] Pair {best_pair_idx} ASSIGNED -> Escaped Enemy {enemy.id}")
+                print(f"          Pair pos: ({pair_center[0]:.0f}, {pair_center[1]:.0f})")
+                print(f"          Enemy pos: ({enemy.x:.0f}, {enemy.y:.0f})")
+                print(f"          Effective distance: {best_cost:.1f}")
 
     def _issue_tactical_command(
         self,
@@ -960,20 +1130,53 @@ class MLSimulation:
                         self._pair_targets[pair_idx] = None
                         continue
 
-                    # === REASSIGNED PAIR (chasing missed enemy) ===
+                    # === RETURNING TO HOME POSITION ===
+                    if assigned_cluster_id == RETURNING_HOME_CLUSTER_ID:
+                        home_pos = self._pair_home_positions.get(pair_idx)
+                        if home_pos is not None:
+                            (home_f1_x, home_f1_y), (home_f2_x, home_f2_y) = home_pos
+
+                            # Check if arrived at home
+                            dist_f1 = math.sqrt((f1.x - home_f1_x)**2 + (f1.y - home_f1_y)**2)
+                            dist_f2 = math.sqrt((f2.x - home_f2_x)**2 + (f2.y - home_f2_y)**2)
+
+                            if dist_f1 <= HOME_ARRIVAL_THRESHOLD and dist_f2 <= HOME_ARRIVAL_THRESHOLD:
+                                # Arrived at home - become reserve
+                                print(f"[HOME] Pair {pair_idx} arrived at home position, now RESERVE")
+                                self._pair_assignments[pair_idx] = None
+                                self._pair_targets[pair_idx] = None
+                                f1.vx = f1.vy = 0
+                                f2.vx = f2.vy = 0
+                                # Snap to exact home position
+                                f1.x, f1.y = home_f1_x, home_f1_y
+                                f2.x, f2.y = home_f2_x, home_f2_y
+                            else:
+                                # Still returning - move toward home
+                                f1.set_velocity_towards(home_f1_x, home_f1_y, CONFIG["friendly_speed"])
+                                f2.set_velocity_towards(home_f2_x, home_f2_y, CONFIG["friendly_speed"])
+                                # Log occasionally
+                                if int(self.sim_time * 10) % 50 == 0:
+                                    print(f"[RETURN] Pair {pair_idx} returning home, dist=({dist_f1:.0f}m, {dist_f2:.0f}m)")
+                        continue
+
+                    # === REASSIGNED PAIR (chasing missed/escaped enemy) ===
                     # Negative cluster_id indicates direct enemy assignment from reassignment
                     if assigned_cluster_id < 0:
-                        # This pair was reassigned to chase a specific missed enemy
+                        # This pair was reassigned to chase a specific missed/escaped enemy
                         # The target is already set in _pair_targets by _check_and_reassign_missed_enemies
                         target_enemy = self._pair_targets.get(pair_idx)
                         if target_enemy is not None and target_enemy.is_active:
+                            # Log chase status occasionally
+                            if int(self.sim_time * 10) % 50 == 0:  # Every 5 seconds
+                                pair_center = ((f1.x + f2.x) / 2, (f1.y + f2.y) / 2)
+                                dist = math.sqrt((target_enemy.x - pair_center[0])**2 + (target_enemy.y - pair_center[1])**2)
+                                print(f"[CHASE] Reassigned Pair {pair_idx} -> Enemy {target_enemy.id}, dist={dist:.0f}m")
                             self._update_pair_direct_chase(f1, f2, target_enemy, net_spacing)
                         else:
-                            # Target was neutralized, this pair becomes reserve again
-                            self._pair_assignments[pair_idx] = None
+                            # Target was neutralized - return to home position
+                            print(f"[RETURN] Pair {pair_idx} mission complete, returning to HOME")
+                            self._pair_assignments[pair_idx] = RETURNING_HOME_CLUSTER_ID
                             self._pair_targets[pair_idx] = None
-                            f1.vx = f1.vy = 0
-                            f2.vx = f2.vy = 0
                         continue
 
                     # === FIXED TARGET LOGIC with UNIQUE TARGETING ===
@@ -1039,6 +1242,10 @@ class MLSimulation:
                 # An enemy is "missed" if it's closer to mothership than its assigned pair
                 self._check_and_reassign_missed_enemies(pairs)
 
+                # === CHECK FOR ESCAPED ENEMIES ===
+                # An enemy is "escaped" if it moves beyond ESCAPE_DISTANCE_THRESHOLD from cluster center
+                self._check_escaped_enemies(pairs)
+
             # else: Friendlies stay stationary (vx=vy=0) until tactical command
         else:
             self._cluster_labels = np.array([])
@@ -1074,6 +1281,23 @@ class MLSimulation:
                                 enemy.vx = 0.0
                                 enemy.vy = 0.0
                                 self.neutralized_count += 1
+
+                                # Remove captured enemy from cluster membership
+                                self._remove_enemy_from_cluster(enemy.id)
+                                # Also remove from targeted set
+                                self._targeted_enemies.discard(enemy.id)
+
+                                # === RETURN TO HOME after capture ===
+                                # Find which pair captured this enemy and start returning to home
+                                pairs = self._get_pair_list()
+                                for pair_idx, (p1, p2) in enumerate(pairs):
+                                    if (p1.id == f.id and p2.id == partner.id) or (p1.id == partner.id and p2.id == f.id):
+                                        # This pair captured the enemy - start returning to home position
+                                        self._pair_assignments[pair_idx] = RETURNING_HOME_CLUSTER_ID
+                                        self._pair_targets[pair_idx] = None
+                                        print(f"[RETURN] Pair {pair_idx} captured Enemy {enemy.id}, returning to HOME position")
+                                        break
+
                                 print(f"[CAPTURE-POST] enemy.id={enemy.id}, neutralized_count={self.neutralized_count}, total={self.total_enemies}, remaining={self.total_enemies - self.neutralized_count}")
                                 self.renderer.add_explosion(enemy.x, enemy.y, self.sim_time)
 
