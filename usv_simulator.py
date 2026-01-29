@@ -274,7 +274,7 @@ class AttackPatternGenerator:
     @staticmethod
     def generate_wave(num_enemies: int, num_waves: int,
                       spawn_radius: float, target: Tuple[float, float],
-                      world_size: float, wave_delay: float = 10.0,
+                      world_size: float, wave_delay: float = 5.0,
                       wave_gap: float = 800.0) -> List[Tuple[USV, float]]:
         """
         Wave Attack: Sequential waves from the SAME direction.
@@ -282,8 +282,8 @@ class AttackPatternGenerator:
         All waves share one approach angle. Each wave is a lateral line
         of ships (side by side), separated by distance gaps.
           - 1st wave (closest): spawns at spawn_radius, activated at t=0
-          - 2nd wave (behind):  spawns at spawn_radius + wave_gap, activated at t=wave_delay
-          - 3rd wave (furthest): spawns at spawn_radius + 2*wave_gap, activated at t=2*wave_delay
+          - 2nd wave (behind):  spawns at spawn_radius + wave_gap, activated at t=5s
+          - 3rd wave (furthest): spawns at spawn_radius + 2*wave_gap, activated at t=10s
 
         Returns list of (USV, spawn_time) tuples.
         """
@@ -337,77 +337,71 @@ class AttackPatternGenerator:
                                target: Tuple[float, float],
                                world_size: float) -> List[USV]:
         """
-        Diversionary Attack: Mix of decoys and real threats.
-        Some enemies feint, others attack directly, some circle around.
+        Diversionary Attack: 3 clustered groups from 3 directions (~120° apart).
+
+        Each direction has a small cluster of 3-4 ships approaching together.
+        This simulates a coordinated multi-directional attack.
+
+        Visual shape:
+          - Direction 1 (0°)   : 3-4 ships clustered
+          - Direction 2 (120°) : 3-4 ships clustered
+          - Direction 3 (240°) : 3-4 ships clustered
         """
         enemies = []
+        num_directions = 3
+        cluster_spread_deg = random.uniform(8.0, 15.0)  # Spread within each cluster
+        cluster_spread_rad = math.radians(cluster_spread_deg) / 2
 
-        # Distribution: 40% direct, 30% flanking, 30% feinting
-        num_direct = int(num_enemies * 0.4)
-        num_flanking = int(num_enemies * 0.3)
-        num_feinting = num_enemies - num_direct - num_flanking
+        # Base angles: 120° apart with random rotation
+        base_angle_offset = random.uniform(0, 2 * math.pi)
+        direction_angles = []
+        for i in range(num_directions):
+            base_angle = base_angle_offset + (2 * math.pi * i / num_directions)
+            # Add some randomization to direction (±15°)
+            angle_jitter = random.uniform(-math.pi/12, math.pi/12)
+            direction_angles.append(base_angle + angle_jitter)
 
-        base_angle = random.uniform(0, 2 * math.pi)
+        # Distribute enemies across directions
+        enemies_per_direction = num_enemies // num_directions
+        remainder = num_enemies % num_directions
 
-        # Direct attackers
-        for i in range(num_direct):
-            angle = base_angle + random.uniform(-math.pi/4, math.pi/4)
-            distance = spawn_radius + random.uniform(0, 300)
+        enemy_id = 100
 
-            x = target[0] + distance * math.cos(angle)
-            y = target[1] + distance * math.sin(angle)
-            x = max(0, min(world_size, x))
-            y = max(0, min(world_size, y))
+        for dir_idx, dir_angle in enumerate(direction_angles):
+            # Number of enemies in this direction
+            n_in_cluster = enemies_per_direction + (1 if dir_idx < remainder else 0)
 
-            enemy = USV(
-                id=100 + i,
-                x=x, y=y,
-                is_friendly=False,
-                max_speed=CONFIG["enemy_speed"]
-            )
-            enemy.set_velocity_towards(target[0], target[1], CONFIG["enemy_speed"])
-            enemies.append(enemy)
+            # Distance variation for this cluster
+            cluster_base_dist = spawn_radius + random.uniform(-300, 300)
 
-        # Flanking attackers (approach from sides)
-        for i in range(num_flanking):
-            angle = base_angle + math.pi/2 + random.choice([-1, 1]) * random.uniform(0.2, 0.8)
-            distance = spawn_radius + random.uniform(200, 600)
+            for i in range(n_in_cluster):
+                # Spread ships within the cluster (lateral spread)
+                if n_in_cluster > 1:
+                    frac = i / (n_in_cluster - 1) - 0.5  # -0.5 to +0.5
+                    lateral_offset = frac * 2 * cluster_spread_rad
+                else:
+                    lateral_offset = 0.0
 
-            x = target[0] + distance * math.cos(angle)
-            y = target[1] + distance * math.sin(angle)
-            x = max(0, min(world_size, x))
-            y = max(0, min(world_size, y))
+                angle = dir_angle + lateral_offset
+                angle += random.uniform(-0.03, 0.03)  # tiny jitter
 
-            enemy = USV(
-                id=100 + num_direct + i,
-                x=x, y=y,
-                is_friendly=False,
-                max_speed=CONFIG["enemy_speed"] * 0.8  # Slightly slower
-            )
-            enemy.set_velocity_towards(target[0], target[1], enemy.max_speed)
-            enemies.append(enemy)
+                # Slight distance variation within cluster
+                distance = cluster_base_dist + random.uniform(-150, 200)
 
-        # Feinting attackers (zigzag approach)
-        for i in range(num_feinting):
-            angle = base_angle + random.uniform(-math.pi, math.pi)
-            distance = spawn_radius + random.uniform(100, 400)
+                x = target[0] + distance * math.cos(angle)
+                y = target[1] + distance * math.sin(angle)
+                x = max(0, min(world_size, x))
+                y = max(0, min(world_size, y))
 
-            x = target[0] + distance * math.cos(angle)
-            y = target[1] + distance * math.sin(angle)
-            x = max(0, min(world_size, x))
-            y = max(0, min(world_size, y))
-
-            enemy = USV(
-                id=100 + num_direct + num_flanking + i,
-                x=x, y=y,
-                is_friendly=False,
-                max_speed=CONFIG["enemy_speed"] * 0.9
-            )
-            # Initial direction offset
-            offset_angle = angle + math.pi + random.uniform(-0.5, 0.5)
-            enemy.vx = enemy.max_speed * math.cos(offset_angle)
-            enemy.vy = enemy.max_speed * math.sin(offset_angle)
-            enemies.append(enemy)
+                enemy = USV(
+                    id=enemy_id,
+                    x=x, y=y,
+                    is_friendly=False,
+                    max_speed=CONFIG["enemy_speed"]
+                )
+                enemy.set_velocity_towards(target[0], target[1], CONFIG["enemy_speed"])
+                enemies.append(enemy)
+                enemy_id += 1
 
         return enemies
 

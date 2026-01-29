@@ -42,6 +42,7 @@ from ml.labels import FormationClass, FORMATION_NAMES
 from ml.constants import (
     DEFENSE_CENTER, NET_SPACING_BASE, MISSED_THRESHOLD, ESCAPE_DISTANCE_THRESHOLD,
     RETURNING_HOME_CLUSTER_ID, HOME_ARRIVAL_THRESHOLD,
+    POST_CAPTURE_DISTANCE_THRESHOLD, POST_CAPTURE_ANGLE_THRESHOLD,
 )
 
 # Import LLM Commander
@@ -916,6 +917,152 @@ class MLSimulation:
                 print(f"          Enemy pos: ({enemy.x:.0f}, {enemy.y:.0f})")
                 print(f"          Effective distance: {best_cost:.1f}")
 
+    def _check_post_capture_reassignment(
+        self,
+        capturing_pair_idx: int,
+        f1: USV,
+        f2: USV,
+        pairs: List[Tuple[USV, USV]],
+    ) -> bool:
+        """
+        After capturing an enemy, check if there's a nearby enemy to chase instead of returning home.
+
+        Criteria for reassignment:
+          1. Enemy must be within POST_CAPTURE_DISTANCE_THRESHOLD (150m) of the pair
+          2. Enemy must be within POST_CAPTURE_ANGLE_THRESHOLD (30°) of pair's heading
+          3. If enemy is already assigned to another pair, compare effectiveness
+
+        Args:
+            capturing_pair_idx: Index of the pair that just captured an enemy
+            f1, f2: The two USVs in the pair
+            pairs: List of all pairs for comparison
+
+        Returns:
+            True if reassigned to a new target, False if should return home
+        """
+        from ml.ortools_assignment import calculate_effective_distance
+
+        pair_center = ((f1.x + f2.x) / 2, (f1.y + f2.y) / 2)
+        pair_heading = math.degrees(f1.heading)
+
+        # Find candidate enemies
+        candidates = []
+
+        for enemy in self.enemies:
+            if not enemy.is_active:
+                continue
+
+            # Skip if this enemy is the one we just captured (should already be inactive)
+            if enemy.id in self._counted_enemy_ids:
+                continue
+
+            # Calculate distance
+            dist = math.sqrt(
+                (enemy.x - pair_center[0])**2 +
+                (enemy.y - pair_center[1])**2
+            )
+
+            # Check distance threshold
+            if dist > POST_CAPTURE_DISTANCE_THRESHOLD:
+                continue
+
+            # Calculate bearing to enemy
+            dx = enemy.x - pair_center[0]
+            dy = enemy.y - pair_center[1]
+            bearing_rad = math.atan2(-dy, dx)  # Pygame Y-axis inverted
+            bearing_deg = math.degrees(bearing_rad)
+
+            # Calculate relative angle
+            relative_angle = bearing_deg - pair_heading
+            # Normalize to [-180, 180]
+            while relative_angle > 180:
+                relative_angle -= 360
+            while relative_angle < -180:
+                relative_angle += 360
+
+            # Check angle threshold
+            if abs(relative_angle) > POST_CAPTURE_ANGLE_THRESHOLD:
+                continue
+
+            # Calculate effective distance for this pair
+            eff_dist = calculate_effective_distance(
+                pair_center, pair_heading,
+                (enemy.x, enemy.y),
+                angle_weight=1.5
+            )
+
+            candidates.append({
+                'enemy': enemy,
+                'dist': dist,
+                'angle': relative_angle,
+                'eff_dist': eff_dist,
+            })
+
+        if not candidates:
+            return False
+
+        # Sort by effective distance (best first)
+        candidates.sort(key=lambda c: c['eff_dist'])
+
+        print(f"[POST-CAPTURE] Pair {capturing_pair_idx} found {len(candidates)} nearby candidates")
+
+        for candidate in candidates:
+            enemy = candidate['enemy']
+            my_eff_dist = candidate['eff_dist']
+
+            # Check if this enemy is already targeted by another pair
+            assigned_pair_idx = None
+            for pidx, target in self._pair_targets.items():
+                if target is not None and target.id == enemy.id:
+                    assigned_pair_idx = pidx
+                    break
+
+            if assigned_pair_idx is not None and assigned_pair_idx != capturing_pair_idx:
+                # Enemy is already assigned - compare effectiveness
+                other_f1, other_f2 = pairs[assigned_pair_idx]
+                other_center = ((other_f1.x + other_f2.x) / 2, (other_f1.y + other_f2.y) / 2)
+                other_heading = math.degrees(other_f1.heading)
+
+                other_eff_dist = calculate_effective_distance(
+                    other_center, other_heading,
+                    (enemy.x, enemy.y),
+                    angle_weight=1.5
+                )
+
+                print(f"[POST-CAPTURE] Comparing for Enemy {enemy.id}:")
+                print(f"              Pair {capturing_pair_idx} eff_dist={my_eff_dist:.1f}")
+                print(f"              Pair {assigned_pair_idx} eff_dist={other_eff_dist:.1f}")
+
+                # If I'm more effective (lower cost), steal the target
+                if my_eff_dist < other_eff_dist:
+                    # Release from other pair
+                    self._pair_targets[assigned_pair_idx] = None
+                    self._targeted_enemies.discard(enemy.id)
+
+                    # The other pair should find a new target from its cluster
+                    # (it will be handled in the next update cycle)
+                    print(f"[POST-CAPTURE] Pair {capturing_pair_idx} STEALS Enemy {enemy.id} from Pair {assigned_pair_idx}")
+                    print(f"              (my cost {my_eff_dist:.1f} < their cost {other_eff_dist:.1f})")
+                else:
+                    # Other pair is more effective, skip this candidate
+                    print(f"[POST-CAPTURE] Pair {assigned_pair_idx} keeps Enemy {enemy.id} (better positioned)")
+                    continue
+
+            # Assign this enemy to the capturing pair
+            self._pair_targets[capturing_pair_idx] = enemy
+            self._targeted_enemies.add(enemy.id)
+
+            # Use virtual cluster ID for post-capture assignment (-3x)
+            virtual_cluster_id = -3 * enemy.id
+            self._pair_assignments[capturing_pair_idx] = virtual_cluster_id
+
+            print(f"[POST-CAPTURE] Pair {capturing_pair_idx} -> Enemy {enemy.id}")
+            print(f"              dist={candidate['dist']:.0f}m, angle={candidate['angle']:.1f}°, eff_dist={my_eff_dist:.1f}")
+
+            return True  # Successfully reassigned
+
+        return False  # No suitable candidate found
+
     def _issue_tactical_command(
         self,
         pairs: List[Tuple[USV, USV]],
@@ -1159,8 +1306,9 @@ class MLSimulation:
                                     print(f"[RETURN] Pair {pair_idx} returning home, dist=({dist_f1:.0f}m, {dist_f2:.0f}m)")
                         continue
 
-                    # === REASSIGNED PAIR (chasing missed/escaped enemy) ===
-                    # Negative cluster_id indicates direct enemy assignment from reassignment
+                    # === REASSIGNED PAIR (chasing missed/escaped/post-capture enemy) ===
+                    # Negative cluster_id indicates direct enemy assignment:
+                    #   -1x = missed enemy, -2x = escaped enemy, -3x = post-capture reassignment
                     if assigned_cluster_id < 0:
                         # This pair was reassigned to chase a specific missed/escaped enemy
                         # The target is already set in _pair_targets by _check_and_reassign_missed_enemies
@@ -1287,15 +1435,23 @@ class MLSimulation:
                                 # Also remove from targeted set
                                 self._targeted_enemies.discard(enemy.id)
 
-                                # === RETURN TO HOME after capture ===
-                                # Find which pair captured this enemy and start returning to home
+                                # === POST-CAPTURE REASSIGNMENT or RETURN TO HOME ===
+                                # Find which pair captured this enemy
                                 pairs = self._get_pair_list()
                                 for pair_idx, (p1, p2) in enumerate(pairs):
                                     if (p1.id == f.id and p2.id == partner.id) or (p1.id == partner.id and p2.id == f.id):
-                                        # This pair captured the enemy - start returning to home position
-                                        self._pair_assignments[pair_idx] = RETURNING_HOME_CLUSTER_ID
+                                        # Clear old target first
                                         self._pair_targets[pair_idx] = None
-                                        print(f"[RETURN] Pair {pair_idx} captured Enemy {enemy.id}, returning to HOME position")
+
+                                        # Try to find a nearby enemy to chase
+                                        reassigned = self._check_post_capture_reassignment(
+                                            pair_idx, p1, p2, pairs
+                                        )
+
+                                        if not reassigned:
+                                            # No nearby target - return to home position
+                                            self._pair_assignments[pair_idx] = RETURNING_HOME_CLUSTER_ID
+                                            print(f"[RETURN] Pair {pair_idx} captured Enemy {enemy.id}, returning to HOME position")
                                         break
 
                                 print(f"[CAPTURE-POST] enemy.id={enemy.id}, neutralized_count={self.neutralized_count}, total={self.total_enemies}, remaining={self.total_enemies - self.neutralized_count}")

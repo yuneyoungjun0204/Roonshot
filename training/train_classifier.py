@@ -158,7 +158,7 @@ def train_classifier(
 
     # Learning rate scheduler: reduce LR when validation loss plateaus
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=10, min_lr=1e-6, verbose=True
+        optimizer, mode='max', factor=0.5, patience=10, min_lr=1e-6
     )
 
     # Training loop with early stopping

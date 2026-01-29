@@ -135,7 +135,7 @@ class LLMCommander:
         # RAG components (initialized lazily)
         self._vector_store = None
         self._langchain_chain = None
-        self._ollama_client = None
+        self._ollama_client = NoneA
 
     def _init_ollama(self):
         """Initialize Ollama client."""

@@ -116,6 +116,13 @@ RETURNING_HOME_CLUSTER_ID = -99999  # Special marker for returning state
 HOME_ARRIVAL_THRESHOLD = 50.0  # meters - distance to home position to be considered "arrived"
 
 # =============================================================================
+# POST-CAPTURE REASSIGNMENT
+# =============================================================================
+# After capturing an enemy, check if nearby enemies can be chased instead of returning home
+POST_CAPTURE_DISTANCE_THRESHOLD = 150.0  # meters - enemy must be within this distance to be considered
+POST_CAPTURE_ANGLE_THRESHOLD = 30.0  # degrees - enemy must be within this angle range from pair heading
+
+# =============================================================================
 # DATA AUGMENTATION
 # =============================================================================
 AUGMENT_NOISE_STD = 0.05          # Gaussian noise std (fraction of feature std)
