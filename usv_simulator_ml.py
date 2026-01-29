@@ -44,6 +44,13 @@ from ml.constants import DEFENSE_CENTER, NET_SPACING_BASE
 # Import LLM Commander
 from ml.llm_commander import LLMCommander, rule_based_mapping, get_tactical_command
 
+# Import OR-Tools Assignment (default mode)
+from ml.ortools_assignment import (
+    AssignmentMode,
+    get_tactical_assignment,
+    get_optimal_assignment,
+)
+
 
 class MLRenderer(Renderer):
     """Extended renderer with ML visualization overlays."""
@@ -228,6 +235,150 @@ class MLRenderer(Renderer):
             text = self.font_small.render("Waiting for 5km entry...", True, (180, 180, 100))
             self.screen.blit(text, (panel_x + 15, panel_y + y_off + line_h * 4))
 
+    def draw_assignment_lines(
+        self,
+        friendly_pairs: List[Tuple],  # List of (f1, f2) USV pairs
+        pair_assignments: Dict[int, int],  # pair_idx -> cluster_id
+        cluster_centers: Dict[int, Tuple[float, float]],  # cluster_id -> (x, y)
+        cluster_colors: List[Tuple[int, int, int]],
+    ):
+        """
+        Draw lines connecting friendly pairs to their assigned cluster centers.
+
+        Args:
+            friendly_pairs: List of (USV, USV) tuples for each pair
+            pair_assignments: Mapping from pair index to cluster ID
+            cluster_centers: Mapping from cluster ID to (x, y) center position
+            cluster_colors: List of colors for each cluster
+        """
+        if not pair_assignments or not cluster_centers:
+            return
+
+        for pair_idx, (f1, f2) in enumerate(friendly_pairs):
+            assigned_cluster_id = pair_assignments.get(pair_idx)
+            if assigned_cluster_id is None:
+                continue
+
+            cluster_center = cluster_centers.get(int(assigned_cluster_id))
+            if cluster_center is None:
+                continue
+
+            # Get pair center
+            pair_center_x = (f1.x + f2.x) / 2
+            pair_center_y = (f1.y + f2.y) / 2
+
+            # Convert to screen coordinates
+            pair_screen = self.world_to_screen(pair_center_x, pair_center_y)
+            cluster_screen = self.world_to_screen(cluster_center[0], cluster_center[1])
+
+            # Get color for this cluster
+            color = cluster_colors[int(assigned_cluster_id) % len(cluster_colors)]
+
+            # Draw dashed line from pair center to cluster center
+            self._draw_dashed_line(
+                pair_screen, cluster_screen, color, dash_length=10, gap_length=6
+            )
+
+            # Draw pair index label at pair center
+            label = self.font_small.render(f"P{pair_idx}", True, color)
+            self.screen.blit(label, (pair_screen[0] - 10, pair_screen[1] - 25))
+
+            # Draw cluster ID label at cluster center
+            label = self.font_small.render(f"C{assigned_cluster_id}", True, color)
+            self.screen.blit(label, (cluster_screen[0] - 10, cluster_screen[1] - 25))
+
+    def draw_target_lines(
+        self,
+        friendly_pairs: List[Tuple],  # List of (f1, f2) USV pairs
+        pair_targets: Dict[int, 'USV'],  # pair_idx -> current target enemy
+        pair_assignments: Dict[int, int],  # pair_idx -> cluster_id (for colors)
+        cluster_colors: List[Tuple[int, int, int]],
+    ):
+        """
+        Draw lines connecting friendly pairs to their CURRENT target enemies.
+        Lines update every frame as targets move or change.
+
+        Args:
+            friendly_pairs: List of (USV, USV) tuples for each pair
+            pair_targets: Mapping from pair index to current target USV (updated each frame)
+            pair_assignments: Mapping from pair index to cluster ID (for color selection)
+            cluster_colors: List of colors for each cluster
+        """
+        if not pair_targets:
+            return
+
+        for pair_idx, (f1, f2) in enumerate(friendly_pairs):
+            target_enemy = pair_targets.get(pair_idx)
+            if target_enemy is None or not target_enemy.is_active:
+                continue
+
+            # Get assigned cluster for color
+            assigned_cluster_id = pair_assignments.get(pair_idx, 0)
+
+            # Get pair center
+            pair_center_x = (f1.x + f2.x) / 2
+            pair_center_y = (f1.y + f2.y) / 2
+
+            # Target is the current enemy position (updates every frame!)
+            target_x = target_enemy.x
+            target_y = target_enemy.y
+
+            # Convert to screen coordinates
+            pair_screen = self.world_to_screen(pair_center_x, pair_center_y)
+            target_screen = self.world_to_screen(target_x, target_y)
+
+            # Get color for this cluster
+            color = cluster_colors[int(assigned_cluster_id) % len(cluster_colors)]
+
+            # Draw dashed line from pair center to target enemy
+            self._draw_dashed_line(
+                pair_screen, target_screen, color, dash_length=10, gap_length=6
+            )
+
+            # Draw pair index label at pair center
+            label = self.font_small.render(f"P{pair_idx}", True, color)
+            self.screen.blit(label, (pair_screen[0] - 10, pair_screen[1] - 25))
+
+    def _draw_dashed_line(
+        self,
+        start: Tuple[int, int],
+        end: Tuple[int, int],
+        color: Tuple[int, int, int],
+        dash_length: int = 10,
+        gap_length: int = 5,
+    ):
+        """Draw a dashed line between two points."""
+        x1, y1 = start
+        x2, y2 = end
+        dx = x2 - x1
+        dy = y2 - y1
+        distance = math.sqrt(dx * dx + dy * dy)
+
+        if distance < 1:
+            return
+
+        # Normalize direction
+        dx /= distance
+        dy /= distance
+
+        # Draw dashes
+        current_dist = 0
+        drawing = True
+
+        while current_dist < distance:
+            segment_length = dash_length if drawing else gap_length
+            next_dist = min(current_dist + segment_length, distance)
+
+            if drawing:
+                start_x = int(x1 + dx * current_dist)
+                start_y = int(y1 + dy * current_dist)
+                end_x = int(x1 + dx * next_dist)
+                end_y = int(y1 + dy * next_dist)
+                pygame.draw.line(self.screen, color, (start_x, start_y), (end_x, end_y), 2)
+
+            current_dist = next_dist
+            drawing = not drawing
+
 
 # Cluster colors for visualization
 CLUSTER_COLORS = [
@@ -243,7 +394,7 @@ CLUSTER_COLORS = [
 
 
 class MLSimulation:
-    """Main simulation controller with ML-driven defense and LLM tactical command."""
+    """Main simulation controller with ML-driven defense and tactical command."""
 
     def __init__(
         self,
@@ -251,7 +402,7 @@ class MLSimulation:
         num_enemies: int = 15,
         num_friendly_pairs: int = 5,
         model_path: str = "models/formation_classifier.pt",
-        use_llm: bool = False,  # Set True to enable LLM tactical command
+        assignment_mode: str = AssignmentMode.ORTOOLS,  # Default: OR-Tools optimal assignment
     ):
         pygame.init()
         pygame.display.set_caption("USV Defense Simulator - ML Enhanced")
@@ -277,6 +428,7 @@ class MLSimulation:
         self.log = SimulationLog()
         self.neutralized_count = 0
         self.total_enemies = num_enemies
+        self._counted_enemy_ids: set = set()  # Track which enemies have been counted (debug)
 
         # ML System
         self.ml_system = DefenseMLSystem(
@@ -285,11 +437,19 @@ class MLSimulation:
         )
         self.ml_system.load_model(model_path)
 
-        # LLM Commander state
-        self._llm_command_issued = False  # True after LLM mapping decision
-        self._llm_pair_assignments: Dict[int, int] = {}  # pair_id -> cluster_id
-        self._llm_reasoning = ""
-        self._use_llm = use_llm  # Whether to use LLM or rule-based fallback
+        # Tactical Command state
+        self._command_issued = False  # True after tactical mapping decision
+        self._pair_assignments: Dict[int, int] = {}  # pair_id -> cluster_id
+        self._assignment_reasoning = ""
+        self._assignment_mode = assignment_mode  # 'ortools', 'llm', or 'scipy'
+        self._cluster_centers: Dict[int, Tuple[float, float]] = {}  # cluster_id -> (x, y)
+        self._cluster_enemy_ids: Dict[int, set] = {}  # cluster_id -> set of enemy IDs (from DBSCAN)
+        self._pair_targets: Dict[int, USV] = {}  # pair_idx -> FIXED target enemy (only changes when target dies)
+        self._targeted_enemies: set = set()  # Set of enemy IDs already targeted (for unique targeting)
+
+        # Missed enemy tracking and reserve reassignment
+        self._missed_enemies: set = set()  # Enemy IDs that have "passed" their assigned pair
+        self._reserve_pairs: set = set()  # Pair indices that are in reserve (no cluster assigned)
 
         # ML state for rendering
         self._cluster_labels = np.array([])
@@ -304,7 +464,9 @@ class MLSimulation:
         Initialize USVs with 4-direction spawn around mothership.
 
         Spawn Pattern:
-          - 5 pairs at 4 cardinal directions (N, E, S, W) + 1 extra at NE
+          - Pairs distributed across 4 cardinal directions (N, E, S, W) in round-robin
+          - Example: 8 pairs → 2 at N, 2 at E, 2 at S, 2 at W
+          - Multiple pairs at same direction have different patrol radii (no overlap)
           - Each pair faces OUTWARD (away from mothership)
           - All pairs start STATIONARY (vx=vy=0) until LLM command
         """
@@ -314,23 +476,33 @@ class MLSimulation:
 
         mothership_pos = CONFIG["mothership_position"]
 
-        # 4 cardinal directions + 1 extra (for 5 pairs)
-        # Angles: N=90°, E=0°, S=270°, W=180°, NE=45° (in standard math coords)
-        # Note: Pygame has Y inverted, so N=-90°, S=90° on screen
+        # 4 cardinal directions only (N, E, S, W)
+        # Angles: N=90°, E=0°, S=270°, W=180° (in standard math coords)
         cardinal_angles = [
-            math.radians(90),    # North (pair 0)
-            math.radians(0),     # East (pair 1)
-            math.radians(270),   # South (pair 2)
-            math.radians(180),   # West (pair 3)
-            math.radians(45),    # North-East (pair 4, extra)
+            math.radians(90),    # North
+            math.radians(0),     # East
+            math.radians(270),   # South
+            math.radians(180),   # West
         ]
 
-        patrol_radius = CONFIG["safe_zone_radii"][1] - 200  # ~1800m from mothership
+        base_patrol_radius = 100  # 100m from mothership (close protection)
+        radius_step = 150  # Distance between pairs at same direction
         net_spacing = 80.0
         usv_id = 0
 
-        for pair_idx in range(min(self.num_friendly_pairs, len(cardinal_angles))):
-            angle = cardinal_angles[pair_idx]
+        # Track how many pairs are placed at each direction
+        direction_counts = [0, 0, 0, 0]  # N, E, S, W
+
+        for pair_idx in range(self.num_friendly_pairs):
+            # Round-robin direction selection: 0,1,2,3,0,1,2,3,...
+            direction_idx = pair_idx % 4
+            angle = cardinal_angles[direction_idx]
+
+            # Calculate patrol radius (offset for multiple pairs at same direction)
+            layer = direction_counts[direction_idx]
+            patrol_radius = base_patrol_radius + layer * radius_step
+            direction_counts[direction_idx] += 1
+
             center_x = mothership_pos[0] + patrol_radius * math.cos(angle)
             center_y = mothership_pos[1] + patrol_radius * math.sin(angle)
 
@@ -339,7 +511,7 @@ class MLSimulation:
             offset = net_spacing / 2
 
             # Face OUTWARD (away from mothership, toward potential threats)
-            heading_outward = angle  # Facing outward
+            heading_outward = angle
 
             f1 = USV(
                 id=usv_id,
@@ -367,37 +539,6 @@ class MLSimulation:
             self.friendlies.extend([f1, f2])
             usv_id += 2
 
-        # Handle extra pairs beyond 5 (distribute evenly)
-        for pair_idx in range(len(cardinal_angles), self.num_friendly_pairs):
-            angle = 2 * math.pi * pair_idx / self.num_friendly_pairs
-            center_x = mothership_pos[0] + patrol_radius * math.cos(angle)
-            center_y = mothership_pos[1] + patrol_radius * math.sin(angle)
-            perp = angle + math.pi / 2
-            offset = net_spacing / 2
-
-            f1 = USV(
-                id=usv_id,
-                x=center_x + offset * math.cos(perp),
-                y=center_y + offset * math.sin(perp),
-                heading=angle,
-                is_friendly=True,
-                pair_id=usv_id + 1,
-                max_speed=CONFIG["friendly_speed"],
-            )
-            f2 = USV(
-                id=usv_id + 1,
-                x=center_x - offset * math.cos(perp),
-                y=center_y - offset * math.sin(perp),
-                heading=angle,
-                is_friendly=True,
-                pair_id=usv_id,
-                max_speed=CONFIG["friendly_speed"],
-            )
-            f1.vx, f1.vy = 0.0, 0.0
-            f2.vx, f2.vy = 0.0, 0.0
-            self.friendlies.extend([f1, f2])
-            usv_id += 2
-
         # Initialize enemies (same as original)
         if self.attack_pattern == AttackPattern.CONCENTRATED:
             self.enemies = AttackPatternGenerator.generate_concentrated(
@@ -408,9 +549,16 @@ class MLSimulation:
             enemies_with_timing = AttackPatternGenerator.generate_wave(
                 self.num_enemies, 3, wave_spawn_radius, defense_center, world_size
             )
+            print(f"[INIT] Wave pattern: generate_wave returned {len(enemies_with_timing)} enemies")
             for enemy, spawn_time in enemies_with_timing:
                 self.enemies.append(enemy)
                 self.enemy_spawn_times[enemy.id] = spawn_time
+            print(f"[INIT] After loop: self.enemies has {len(self.enemies)} enemies, total_enemies={self.total_enemies}")
+            # Debug: Print all enemy IDs and their initial states
+            print(f"[INIT] Enemy details:")
+            for e in self.enemies:
+                spawn_t = self.enemy_spawn_times.get(e.id, "N/A")
+                print(f"  Enemy {e.id}: is_active={e.is_active}, spawn_time={spawn_t}, pos=({e.x:.0f}, {e.y:.0f})")
         elif self.attack_pattern == AttackPattern.DIVERSIONARY:
             self.enemies = AttackPatternGenerator.generate_diversionary(
                 self.num_enemies, spawn_radius, defense_center, world_size
@@ -432,7 +580,173 @@ class MLSimulation:
                     seen.add(partner.id)
         return pairs
 
-    def _issue_llm_command(
+    def _update_pair_direct_chase(
+        self,
+        f1: USV,
+        f2: USV,
+        target_enemy: USV,
+        net_spacing: float = 80.0,
+    ):
+        """
+        Update pair to directly chase the target enemy (no interception prediction).
+        This ensures friendlies always move TOWARDS the enemy, never backing up.
+        """
+        # Target position is the enemy's current position
+        target_x = target_enemy.x
+        target_y = target_enemy.y
+
+        # Calculate perpendicular positions for net formation
+        # Use enemy's velocity direction, or fallback to pair-to-enemy direction
+        enemy_speed = math.sqrt(target_enemy.vx**2 + target_enemy.vy**2)
+        if enemy_speed > 1.0:
+            # Enemy is moving - align net perpendicular to enemy's heading
+            enemy_heading = math.atan2(target_enemy.vy, target_enemy.vx)
+        else:
+            # Enemy is stationary - align net perpendicular to approach direction
+            pair_center_x = (f1.x + f2.x) / 2
+            pair_center_y = (f1.y + f2.y) / 2
+            enemy_heading = math.atan2(
+                target_y - pair_center_y,
+                target_x - pair_center_x
+            )
+
+        perp_angle = enemy_heading + math.pi / 2
+        offset = net_spacing / 2
+
+        # Target positions for each friendly in the pair
+        target1 = (
+            target_x + offset * math.cos(perp_angle),
+            target_y + offset * math.sin(perp_angle)
+        )
+        target2 = (
+            target_x - offset * math.cos(perp_angle),
+            target_y - offset * math.sin(perp_angle)
+        )
+
+        # Set velocities directly towards targets (full speed chase)
+        f1.set_velocity_towards(target1[0], target1[1], CONFIG["friendly_speed"])
+        f2.set_velocity_towards(target2[0], target2[1], CONFIG["friendly_speed"])
+
+    def _check_and_reassign_missed_enemies(
+        self,
+        pairs: List[Tuple[USV, USV]],
+    ):
+        """
+        Check if any assigned enemies have "passed" their friendly pairs.
+
+        An enemy is considered "missed" if:
+          - enemy_dist_to_mothership < pair_dist_to_mothership
+
+        When an enemy is missed:
+          1. Mark the enemy as missed
+          2. Release the original pair (becomes available)
+          3. Find the optimal reserve pair to intercept
+          4. Assign the missed enemy to the reserve pair
+        """
+        mothership_pos = CONFIG["mothership_position"]
+
+        # Collect missed enemies and their original pairs
+        newly_missed = []
+
+        for pair_idx, (f1, f2) in enumerate(pairs):
+            target_enemy = self._pair_targets.get(pair_idx)
+            if target_enemy is None or not target_enemy.is_active:
+                continue
+
+            # Skip if already marked as missed
+            if target_enemy.id in self._missed_enemies:
+                continue
+
+            # Calculate distances to mothership
+            pair_center_x = (f1.x + f2.x) / 2
+            pair_center_y = (f1.y + f2.y) / 2
+            pair_dist = math.sqrt(
+                (pair_center_x - mothership_pos[0])**2 +
+                (pair_center_y - mothership_pos[1])**2
+            )
+
+            enemy_dist = math.sqrt(
+                (target_enemy.x - mothership_pos[0])**2 +
+                (target_enemy.y - mothership_pos[1])**2
+            )
+
+            # Enemy is closer to mothership than the pair = MISSED
+            if enemy_dist < pair_dist:
+                newly_missed.append((pair_idx, target_enemy))
+                self._missed_enemies.add(target_enemy.id)
+                print(f"[MISSED] Enemy {target_enemy.id} passed Pair {pair_idx}! "
+                      f"(enemy_dist={enemy_dist:.0f} < pair_dist={pair_dist:.0f})")
+
+        if not newly_missed:
+            return
+
+        # Find reserve pairs (pairs with no assignment or completed mission)
+        reserve_pairs = []
+        for pair_idx, (f1, f2) in enumerate(pairs):
+            assigned_cluster = self._pair_assignments.get(pair_idx)
+            current_target = self._pair_targets.get(pair_idx)
+
+            # Reserve conditions:
+            # 1. No cluster assigned (true reserve)
+            # 2. Cluster assigned but no current target (mission complete)
+            if assigned_cluster is None or current_target is None:
+                reserve_pairs.append(pair_idx)
+
+        if not reserve_pairs:
+            print(f"[MISSED] No reserve pairs available for {len(newly_missed)} missed enemies!")
+            return
+
+        print(f"[REASSIGN] {len(newly_missed)} missed enemies, {len(reserve_pairs)} reserve pairs available")
+
+        # Optimal reassignment using effective distance
+        for orig_pair_idx, missed_enemy in newly_missed:
+            if not reserve_pairs:
+                print(f"[REASSIGN] No more reserve pairs for Enemy {missed_enemy.id}")
+                break
+
+            # Find the best reserve pair for this missed enemy
+            best_pair_idx = None
+            best_cost = float('inf')
+
+            for reserve_idx in reserve_pairs:
+                f1, f2 = pairs[reserve_idx]
+                pair_center = ((f1.x + f2.x) / 2, (f1.y + f2.y) / 2)
+                pair_heading = math.degrees(f1.heading)
+
+                # Calculate effective distance
+                from ml.ortools_assignment import calculate_effective_distance
+                eff_dist = calculate_effective_distance(
+                    pair_center, pair_heading,
+                    (missed_enemy.x, missed_enemy.y),
+                    angle_weight=1.5
+                )
+
+                if eff_dist < best_cost:
+                    best_cost = eff_dist
+                    best_pair_idx = reserve_idx
+
+            if best_pair_idx is not None:
+                # Release old pair's target
+                if orig_pair_idx in self._pair_targets:
+                    old_target = self._pair_targets[orig_pair_idx]
+                    if old_target and old_target.id in self._targeted_enemies:
+                        self._targeted_enemies.discard(old_target.id)
+                    self._pair_targets[orig_pair_idx] = None
+
+                # Assign to new reserve pair
+                self._pair_targets[best_pair_idx] = missed_enemy
+                self._targeted_enemies.add(missed_enemy.id)
+                reserve_pairs.remove(best_pair_idx)
+
+                # Create a virtual cluster assignment for this pair
+                # Use negative cluster ID to indicate "missed enemy reassignment"
+                virtual_cluster_id = -1 * missed_enemy.id
+                self._pair_assignments[best_pair_idx] = virtual_cluster_id
+
+                print(f"[REASSIGN] Pair {best_pair_idx} -> Enemy {missed_enemy.id} "
+                      f"(cost={best_cost:.1f}, was reserve)")
+
+    def _issue_tactical_command(
         self,
         pairs: List[Tuple[USV, USV]],
         clusters_data: List[Dict],
@@ -440,13 +754,14 @@ class MLSimulation:
         confidence: float,
     ):
         """
-        Issue LLM tactical command for pair-to-cluster mapping.
+        Issue tactical command for pair-to-cluster mapping.
+        Uses OR-Tools (default), LLM, or scipy based on assignment_mode.
         Called ONCE when formation lock is triggered.
         """
-        if self._llm_command_issued:
+        if self._command_issued:
             return
 
-        # Prepare agent data for LLM
+        # Prepare agent data
         agents_data = []
         for pair_idx, (f1, f2) in enumerate(pairs):
             center_x = (f1.x + f2.x) / 2
@@ -458,35 +773,67 @@ class MLSimulation:
                 'angle': heading,
             })
 
-        # Get tactical command (LLM or rule-based fallback)
+        # Store cluster centers and enemy IDs for target selection
+        self._cluster_centers = {}
+        self._cluster_enemy_ids = {}  # cluster_id -> set of enemy IDs
+        for cluster in clusters_data:
+            cid = cluster['cluster_id']
+            center = cluster['center']
+            self._cluster_centers[cid] = (float(center[0]), float(center[1]))
+            # Store enemy IDs (not indices!) that belong to this cluster
+            enemy_ids = cluster.get('enemy_ids', [])
+            self._cluster_enemy_ids[cid] = set(enemy_ids)
+
+        # Get tactical assignment based on mode
         try:
-            assignments, reasoning = get_tactical_command(
+            assignments, reasoning = get_tactical_assignment(
                 agents=agents_data,
                 clusters=clusters_data,
                 formation=formation,
                 confidence=confidence,
-                use_llm=self._use_llm,
+                mode=self._assignment_mode,
                 model_name="qwen2.5:7b-instruct",
             )
-            self._llm_pair_assignments = assignments
-            self._llm_reasoning = reasoning
-            self._llm_command_issued = True
+            self._pair_assignments = assignments
+            self._assignment_reasoning = reasoning
+            self._command_issued = True
+
+            mode_label = {
+                AssignmentMode.ORTOOLS: "OR-Tools Optimal",
+                AssignmentMode.LLM: "LLM Tactical",
+                AssignmentMode.SCIPY: "Scipy Hungarian",
+            }.get(self._assignment_mode, self._assignment_mode)
 
             print("\n" + "=" * 60)
-            print("【LLM TACTICAL COMMAND ISSUED】")
+            print(f"【{mode_label} ASSIGNMENT ISSUED - LOCKED】")
             print("=" * 60)
+            print(f"Mode: {self._assignment_mode.upper()}")
             print(f"Formation: {formation.name} (Confidence: {confidence:.1%})")
-            print(f"Assignments: {assignments}")
+            print(f"Assignments (FIXED): {assignments}")
+            print(f"Cluster Centers (FIXED): {self._cluster_centers}")
             print(f"Reasoning: {reasoning}")
+            print("=" * 60)
+            print("Cluster Enemy Membership:")
+            for cid, enemy_ids in sorted(self._cluster_enemy_ids.items()):
+                print(f"  Cluster {cid}: Enemies {sorted(enemy_ids)}")
+            print("=" * 60)
+
+            # Identify reserve pairs (not assigned to any cluster)
+            all_pair_ids = set(range(len(agents_data)))
+            assigned_pair_ids = set(assignments.keys())
+            reserve_pair_ids = all_pair_ids - assigned_pair_ids
+            if reserve_pair_ids:
+                print(f"RESERVE PAIRS (stay stationary): {sorted(reserve_pair_ids)}")
+            print("NOTE: Assignments are now LOCKED and will NOT change!")
             print("=" * 60 + "\n")
 
         except Exception as e:
-            print(f"[LLM Command] Error: {e}, using rule-based fallback")
-            self._llm_pair_assignments = rule_based_mapping(
-                agents_data, clusters_data, formation
-            )
-            self._llm_reasoning = "Rule-based fallback (LLM error)"
-            self._llm_command_issued = True
+            print(f"[Tactical Command] Error: {e}, using scipy fallback")
+            from ml.ortools_assignment import scipy_optimal_assignment
+            result = scipy_optimal_assignment(agents_data, clusters_data, formation)
+            self._pair_assignments = result.pair_assignments
+            self._assignment_reasoning = f"Scipy fallback: {e}"
+            self._command_issued = True
 
     def update(self):
         """
@@ -503,11 +850,17 @@ class MLSimulation:
         dt = CONFIG["dt"]
         defense_center = CONFIG["defense_center"]
 
+        # Debug: Print state at start of frame (only every 60 frames = 1 second)
+        if int(self.sim_time * 60) % 60 == 0 and self.sim_time > 0:
+            active_count = len([e for e in self.enemies if e.is_active])
+            print(f"[TICK t={self.sim_time:.1f}] neutralized={self.neutralized_count}, active={active_count}, counted_ids={len(self._counted_enemy_ids)}")
+
         # Activate wave enemies
         for enemy in self.enemies:
             if enemy.id in self.enemy_spawn_times:
                 if self.sim_time >= self.enemy_spawn_times[enemy.id] and not enemy.is_active:
                     enemy.is_active = True
+                    print(f"[WAVE-ACTIVATE] Enemy {enemy.id} activated at t={self.sim_time:.1f}")
 
         # Update enemy positions
         for enemy in self.enemies:
@@ -546,22 +899,25 @@ class MLSimulation:
                 )
                 self._confidence = decision.confidence
 
-                # --- LLM COMMAND AT LOCK MOMENT ---
-                if not self._llm_command_issued:
-                    # Prepare cluster data for LLM
+                # --- TACTICAL COMMAND AT LOCK MOMENT ---
+                if not self._command_issued:
+                    # Prepare cluster data with enemy IDs (not indices!)
                     clusters_data = []
                     for m in decision.cluster_metrics:
                         avg_vx = np.mean([active_enemies[i].vx for i in m.enemy_indices]) if m.enemy_indices else 0
                         avg_vy = np.mean([active_enemies[i].vy for i in m.enemy_indices]) if m.enemy_indices else 0
+                        # Convert indices to actual enemy IDs for stable targeting
+                        enemy_ids = [active_enemies[i].id for i in m.enemy_indices if i < len(active_enemies)]
                         clusters_data.append({
                             'cluster_id': m.cluster_id,
                             'center': m.center,
-                            'count': m.size,  # ClusterMetrics uses 'size' not 'count'
+                            'count': m.size,
                             'velocity': (avg_vx, avg_vy),
                             'enemy_indices': m.enemy_indices,
+                            'enemy_ids': enemy_ids,  # Actual enemy IDs for targeting
                         })
 
-                    self._issue_llm_command(
+                    self._issue_tactical_command(
                         pairs, clusters_data,
                         decision.formation_class, decision.confidence
                     )
@@ -579,54 +935,116 @@ class MLSimulation:
             else:
                 self._cluster_labels = np.zeros(len(active_enemies), dtype=int)
 
-            # --- FRIENDLY MOVEMENT (only after LLM command) ---
-            if self._llm_command_issued:
-                # Move friendlies based on LLM pair-cluster assignments
+            # --- FRIENDLY MOVEMENT (only after tactical command) ---
+            if self._command_issued:
+                # Clean up targeted enemies set (remove dead enemies)
+                self._targeted_enemies = {
+                    eid for eid in self._targeted_enemies
+                    if any(e.id == eid and e.is_active for e in self.enemies)
+                }
+
+                # Move friendlies based on pair-cluster assignments
+                # Pairs without assignment stay as RESERVE (stationary)
                 for pair_idx, (f1, f2) in enumerate(pairs):
-                    # Get assigned cluster from LLM
-                    assigned_cluster_id = self._llm_pair_assignments.get(pair_idx)
-
-                    # Find target enemy within assigned cluster
-                    target_enemy = None
                     net_spacing = NET_SPACING_BASE
+                    pair_center = np.array([(f1.x + f2.x) / 2, (f1.y + f2.y) / 2])
 
-                    if assigned_cluster_id is not None:
-                        # Find the cluster metrics for this cluster
-                        cluster_metrics = None
-                        for m in decision.cluster_metrics:
-                            if m.cluster_id == assigned_cluster_id:
-                                cluster_metrics = m
-                                break
+                    # Check if this pair has a cluster assignment
+                    assigned_cluster_id = self._pair_assignments.get(pair_idx)
 
-                        if cluster_metrics and cluster_metrics.enemy_indices:
-                            # Find closest enemy in the assigned cluster
-                            pair_center = np.array([(f1.x + f2.x) / 2, (f1.y + f2.y) / 2])
+                    # === NO ASSIGNMENT = RESERVE UNIT (stay stationary) ===
+                    if assigned_cluster_id is None:
+                        # No cluster assigned - this pair is reserve, stay put
+                        f1.vx = f1.vy = 0
+                        f2.vx = f2.vy = 0
+                        self._pair_targets[pair_idx] = None
+                        continue
+
+                    # === REASSIGNED PAIR (chasing missed enemy) ===
+                    # Negative cluster_id indicates direct enemy assignment from reassignment
+                    if assigned_cluster_id < 0:
+                        # This pair was reassigned to chase a specific missed enemy
+                        # The target is already set in _pair_targets by _check_and_reassign_missed_enemies
+                        target_enemy = self._pair_targets.get(pair_idx)
+                        if target_enemy is not None and target_enemy.is_active:
+                            self._update_pair_direct_chase(f1, f2, target_enemy, net_spacing)
+                        else:
+                            # Target was neutralized, this pair becomes reserve again
+                            self._pair_assignments[pair_idx] = None
+                            self._pair_targets[pair_idx] = None
+                            f1.vx = f1.vy = 0
+                            f2.vx = f2.vy = 0
+                        continue
+
+                    # === FIXED TARGET LOGIC with UNIQUE TARGETING ===
+                    # Check if current target is still alive
+                    current_target = self._pair_targets.get(pair_idx)
+                    if current_target is not None and current_target.is_active:
+                        # Keep chasing the same target (NO CHANGE)
+                        target_enemy = current_target
+                    else:
+                        # Remove old target from targeted set if it died
+                        if current_target is not None:
+                            self._targeted_enemies.discard(current_target.id)
+
+                        # Need new target: either first assignment or target died
+                        target_enemy = None
+
+                        if len(active_enemies) > 0:
+                            # Get enemy IDs that belong to this cluster (from DBSCAN at lock time)
+                            cluster_enemy_ids = self._cluster_enemy_ids.get(int(assigned_cluster_id), set())
+
+                            # Find closest UNTARGETED enemy in the assigned cluster ONLY
                             min_dist = float('inf')
-                            for enemy_idx in cluster_metrics.enemy_indices:
-                                if enemy_idx < len(active_enemies):
-                                    e = active_enemies[enemy_idx]
-                                    dist = np.linalg.norm([e.x - pair_center[0], e.y - pair_center[1]])
-                                    if dist < min_dist:
-                                        min_dist = dist
+                            for e in active_enemies:
+                                # Only consider enemies that belong to this cluster
+                                if e.id not in cluster_enemy_ids:
+                                    continue
+                                # Skip already targeted enemies (unique 1:1 targeting)
+                                if e.id in self._targeted_enemies:
+                                    continue
+                                if e.is_active:
+                                    dist_to_pair = np.linalg.norm([
+                                        e.x - pair_center[0],
+                                        e.y - pair_center[1]
+                                    ])
+                                    if dist_to_pair < min_dist:
+                                        min_dist = dist_to_pair
                                         target_enemy = e
-                            net_spacing = cluster_metrics.net_spacing
 
-                    # Update friendly pair movement
+                        # NO FALLBACK: If cluster exhausted, stay stationary (don't chase other clusters)
+                        # This pair completed its mission or is waiting for reassignment
+
+                        # Log new target assignment and mark as targeted
+                        if target_enemy is not None:
+                            old_id = current_target.id if current_target else "None"
+                            self._targeted_enemies.add(target_enemy.id)
+                            print(f"[Target] Pair {pair_idx}: {old_id} -> Enemy {target_enemy.id} (Cluster {assigned_cluster_id})")
+
+                    # Store target (only changes when target dies)
+                    self._pair_targets[pair_idx] = target_enemy
+
+                    # Update friendly pair movement - DIRECT CHASE
                     if target_enemy is not None:
-                        FriendlyAI.update_friendly_pair(
-                            f1, f2, target_enemy, defense_center, net_spacing
+                        self._update_pair_direct_chase(
+                            f1, f2, target_enemy, net_spacing
                         )
                     else:
-                        # No assignment or cluster depleted - patrol around mothership
-                        FriendlyAI.update_friendly_pair(
-                            f1, f2, None, defense_center, NET_SPACING_BASE
-                        )
-            # else: Friendlies stay stationary (vx=vy=0) until command
+                        # Cluster exhausted (all enemies dead/targeted) - stay stationary
+                        # This pair completed its mission, waiting as reserve
+                        f1.vx = f1.vy = 0
+                        f2.vx = f2.vy = 0
+
+                # === CHECK FOR MISSED ENEMIES AND REASSIGN TO RESERVES ===
+                # An enemy is "missed" if it's closer to mothership than its assigned pair
+                self._check_and_reassign_missed_enemies(pairs)
+
+            # else: Friendlies stay stationary (vx=vy=0) until tactical command
         else:
             self._cluster_labels = np.array([])
 
-        # Update friendly positions (only after LLM command issued)
-        if self._llm_command_issued:
+        # Update friendly positions (only after tactical command issued)
+        if self._command_issued:
             for f in self.friendlies:
                 if f.is_active:
                     f.update_position(dt)
@@ -647,10 +1065,16 @@ class MLSimulation:
                                 CONFIG["capture_distance"],
                                 CONFIG["net_max_length"],
                             ):
+                                print(f"[CAPTURE-PRE] enemy.id={enemy.id}, is_active={enemy.is_active}, neutralized_count={self.neutralized_count}")
+                                if enemy.id in self._counted_enemy_ids:
+                                    print(f"[BUG!] Enemy {enemy.id} already counted! Skipping double-count.")
+                                    continue
+                                self._counted_enemy_ids.add(enemy.id)
                                 enemy.is_active = False
                                 enemy.vx = 0.0
                                 enemy.vy = 0.0
                                 self.neutralized_count += 1
+                                print(f"[CAPTURE-POST] enemy.id={enemy.id}, neutralized_count={self.neutralized_count}, total={self.total_enemies}, remaining={self.total_enemies - self.neutralized_count}")
                                 self.renderer.add_explosion(enemy.x, enemy.y, self.sim_time)
 
                                 dist_to_center = PhysicsEngine.distance_to_point(
@@ -673,10 +1097,19 @@ class MLSimulation:
                     enemy.x, enemy.y, mothership_pos[0], mothership_pos[1]
                 )
                 if dist <= collision_distance:
+                    print(f"[MOTHERSHIP-PRE] enemy.id={enemy.id}, is_active={enemy.is_active}, dist={dist:.1f}, neutralized_count={self.neutralized_count}")
+                    if enemy.id in self._counted_enemy_ids:
+                        print(f"[BUG!] Enemy {enemy.id} already counted! Skipping double-count.")
+                        enemy.is_active = False  # Still deactivate to prevent further checks
+                        enemy.vx = 0.0
+                        enemy.vy = 0.0
+                        continue
+                    self._counted_enemy_ids.add(enemy.id)
                     enemy.is_active = False
                     enemy.vx = 0.0
                     enemy.vy = 0.0
                     self.neutralized_count += 1
+                    print(f"[MOTHERSHIP-POST] enemy.id={enemy.id}, neutralized_count={self.neutralized_count}, total={self.total_enemies}, remaining={self.total_enemies - self.neutralized_count}")
                     self.renderer.add_explosion(
                         enemy.x, enemy.y, self.sim_time, 1.0, True
                     )
@@ -701,6 +1134,24 @@ class MLSimulation:
 
         # End conditions: all neutralized, or time up
         if remaining <= 0 or self.sim_time >= CONFIG["max_time"]:
+            active_count = len([e for e in self.enemies if e.is_active])
+            print(f"\n{'='*60}")
+            print(f"[END] SIMULATION ENDING")
+            print(f"{'='*60}")
+            print(f"[END] total_enemies={self.total_enemies}")
+            print(f"[END] neutralized_count={self.neutralized_count}")
+            print(f"[END] remaining (calculated)={remaining}")
+            print(f"[END] active enemies (actual)={active_count}")
+            print(f"[END] counted_enemy_ids={sorted(self._counted_enemy_ids)}")
+            print(f"[END] len(self.enemies)={len(self.enemies)}")
+            print(f"[END] time={self.sim_time:.1f}")
+            if active_count != remaining:
+                print(f"[END] WARNING: Mismatch! active_count ({active_count}) != remaining ({remaining})")
+                print(f"[END] This indicates a bug in neutralized_count tracking!")
+                # List all enemy states for debugging
+                for e in self.enemies:
+                    print(f"  Enemy {e.id}: is_active={e.is_active}, was_counted={e.id in self._counted_enemy_ids}")
+            print(f"{'='*60}\n")
             self.running = False
 
     def render(self):
@@ -715,6 +1166,16 @@ class MLSimulation:
             enemy_pos = np.array([[e.x, e.y] for e in active_enemies])
             self.renderer.draw_cluster_overlay(
                 enemy_pos, self._cluster_labels, CLUSTER_COLORS
+            )
+
+        # Draw assignment lines (pair -> current target enemy visualization)
+        if self._command_issued and self._pair_targets:
+            pairs = self._get_pair_list()
+            self.renderer.draw_target_lines(
+                pairs,
+                self._pair_targets,
+                self._pair_assignments,
+                CLUSTER_COLORS,
             )
 
         # Draw nets
@@ -778,6 +1239,7 @@ class MLSimulation:
                         self.attack_pattern,
                         self.num_enemies,
                         self.num_friendly_pairs,
+                        assignment_mode=self._assignment_mode,
                     )
 
     def save_log(self, filename: str = "usv_ml_log.csv"):
@@ -832,7 +1294,10 @@ class MLSimulation:
         print("USV Defense Simulator - ML Enhanced")
         print("=" * 60)
         print(f"Attack Pattern: {self.attack_pattern.value}")
-        print(f"Enemies: {self.num_enemies}")
+        print(f"Enemies: {self.num_enemies} (total_enemies={self.total_enemies})")
+        print(f"Enemy objects created: {len(self.enemies)}")
+        print(f"Initial neutralized_count: {self.neutralized_count}")
+        print(f"Initial active enemies: {len([e for e in self.enemies if e.is_active])}")
         print(f"Friendly Pairs: {self.num_friendly_pairs}")
         print(f"ML Model: {'Loaded' if self.ml_system.has_model else 'Rule-based fallback'}")
         print("-" * 60)
@@ -867,9 +1332,9 @@ class MLSimulation:
 
 
 def main():
-    """Entry point for ML simulator with LLM tactical command."""
+    """Entry point for ML simulator with OR-Tools/LLM tactical command."""
     print("\n" + "=" * 50)
-    print("USV Defense Simulator - ML + LLM Tactical Command")
+    print("USV Defense Simulator - ML + Tactical Command")
     print("=" * 50)
     print("\n【Attack Pattern Selection】")
     print("1. Concentrated Attack (집중형)")
@@ -893,42 +1358,67 @@ def main():
         num_enemies = int(enemies_input) if enemies_input else 10
         num_enemies = max(5, min(15, num_enemies))
 
-        pairs_input = input("Number of friendly pairs (2-8) [default: 5]: ").strip()
-        num_pairs = int(pairs_input) if pairs_input else 5
-        num_pairs = max(2, min(8, num_pairs))
+        pairs_input = input("Number of friendly pairs (2-12) [default: 12]: ").strip()
+        num_pairs = int(pairs_input) if pairs_input else 12
+        num_pairs = max(2, min(12, num_pairs))
 
-        llm_input = input("Enable LLM tactical command? (y/n) [default: n]: ").strip().lower()
-        use_llm = llm_input == 'y' or llm_input == 'yes'
+        print("\n【Assignment Mode Selection】")
+        print("1. OR-Tools Optimal (default) - Fast, deterministic, guaranteed 1:1 mapping")
+        print("2. LLM Tactical - Uses Ollama LLM for tactical reasoning")
+        print("3. Scipy Hungarian - Fallback mode using scipy")
+        print("-" * 40)
 
-        if use_llm:
-            print("\n【LLM Mode Enabled】")
+        mode_input = input("Select assignment mode (1-3) [default: 1]: ").strip()
+        if mode_input == "" or mode_input == "1":
+            assignment_mode = AssignmentMode.ORTOOLS
+        elif mode_input == "2":
+            assignment_mode = AssignmentMode.LLM
+        elif mode_input == "3":
+            assignment_mode = AssignmentMode.SCIPY
+        else:
+            print("Invalid choice, using OR-Tools")
+            assignment_mode = AssignmentMode.ORTOOLS
+
+        if assignment_mode == AssignmentMode.ORTOOLS:
+            print("\n【OR-Tools Mode (Default)】")
+            print("  - Linear Sum Assignment for optimal 1:1 mapping")
+            print("  - Uses effective distance: distance + |angle| × 1.5")
+            print("  - Deterministic results, no variability")
+        elif assignment_mode == AssignmentMode.LLM:
+            print("\n【LLM Mode】")
             print("  - Recommended model: qwen2.5:7b-instruct (via Ollama)")
             print("  - Ensure Ollama is running: ollama serve")
             print("  - Pull model if needed: ollama pull qwen2.5:7b-instruct")
         else:
-            print("\n【Rule-based Mode】")
-            print("  - Using Hungarian algorithm for pair-cluster assignment")
+            print("\n【Scipy Mode】")
+            print("  - Hungarian algorithm via scipy.optimize.linear_sum_assignment")
 
     except (ValueError, KeyboardInterrupt):
         print("\nUsing default settings...")
         pattern = AttackPattern.CONCENTRATED
         num_enemies = 10
-        num_pairs = 5
-        use_llm = False
+        num_pairs = 12
+        assignment_mode = AssignmentMode.ORTOOLS
+
+    mode_label = {
+        AssignmentMode.ORTOOLS: "OR-Tools Optimal",
+        AssignmentMode.LLM: "LLM Tactical",
+        AssignmentMode.SCIPY: "Scipy Hungarian",
+    }.get(assignment_mode, assignment_mode)
 
     print("\n" + "-" * 40)
     print("【Simulation Configuration】")
     print(f"  Pattern: {pattern.value}")
     print(f"  Enemies: {num_enemies}")
     print(f"  Friendly Pairs: {num_pairs}")
-    print(f"  LLM Command: {'Enabled' if use_llm else 'Disabled (Rule-based)'}")
+    print(f"  Assignment Mode: {mode_label}")
     print("-" * 40 + "\n")
 
     sim = MLSimulation(
         attack_pattern=pattern,
         num_enemies=num_enemies,
         num_friendly_pairs=num_pairs,
-        use_llm=use_llm,
+        assignment_mode=assignment_mode,
     )
     sim.run()
 

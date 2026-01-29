@@ -63,7 +63,7 @@ FEATURE_NAMES = [
 # =============================================================================
 # DBSCAN DENSITY ANALYSIS
 # =============================================================================
-DBSCAN_EPS = 80.0          # meters - neighborhood radius
+DBSCAN_EPS = 150.0          # meters - neighborhood radius
 DBSCAN_MIN_SAMPLES = 1      # minimum cluster size
 
 # Net spacing parameters

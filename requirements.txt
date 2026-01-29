@@ -6,6 +6,9 @@ scikit-learn
 matplotlib
 scipy
 
+# OR-Tools Optimal Assignment (default)
+ortools
+
 # LLM Tactical Command System (optional)
 ollama
 langchain
