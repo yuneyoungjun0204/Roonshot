@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+data/training_data/
+models/*.pt
+models/*.npz
+*.csv
+.pytest_cache/

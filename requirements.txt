@@ -1,0 +1,13 @@
+pygame
+numpy
+pandas
+torch
+scikit-learn
+matplotlib
+scipy
+
+# LLM Tactical Command System (optional)
+ollama
+langchain
+langchain-community
+chromadb
