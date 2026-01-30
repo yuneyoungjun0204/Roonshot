@@ -53,6 +53,7 @@ from ml.ortools_assignment import (
     AssignmentMode,
     get_tactical_assignment,
     get_optimal_assignment,
+    get_dynamic_assignment,
 )
 
 
@@ -406,7 +407,7 @@ class MLSimulation:
         num_enemies: int = 15,
         num_friendly_pairs: int = 5,
         model_path: str = "models/formation_classifier.pt",
-        assignment_mode: str = AssignmentMode.ORTOOLS,  # Default: OR-Tools optimal assignment
+        assignment_mode: str = AssignmentMode.ORTOOLS,  # Default: OR-Tools static assignment
     ):
         pygame.init()
         pygame.display.set_caption("USV Defense Simulator - ML Enhanced")
@@ -443,13 +444,18 @@ class MLSimulation:
 
         # Tactical Command state
         self._command_issued = False  # True after tactical mapping decision
-        self._pair_assignments: Dict[int, int] = {}  # pair_id -> cluster_id
+        self._pair_assignments: Dict[int, int] = {}  # pair_id -> cluster_id (static) or enemy_id (dynamic)
         self._assignment_reasoning = ""
-        self._assignment_mode = assignment_mode  # 'ortools', 'llm', or 'scipy'
+        self._assignment_mode = assignment_mode  # 'ortools', 'ortools_dynamic', 'llm', or 'scipy'
         self._cluster_centers: Dict[int, Tuple[float, float]] = {}  # cluster_id -> (x, y)
         self._cluster_enemy_ids: Dict[int, set] = {}  # cluster_id -> set of enemy IDs (from DBSCAN)
         self._pair_targets: Dict[int, USV] = {}  # pair_idx -> FIXED target enemy (only changes when target dies)
         self._targeted_enemies: set = set()  # Set of enemy IDs already targeted (for unique targeting)
+
+        # Dynamic mode specific state
+        self._dynamic_assignments: Dict[int, int] = {}  # pair_id -> enemy_id (for dynamic mode)
+        self._dynamic_update_interval = 5  # Update interval in seconds (every 3 seconds)
+        self._last_dynamic_update = 0.0  # Last dynamic update time
 
         # Missed enemy tracking and reserve reassignment
         self._missed_enemies: set = set()  # Enemy IDs that have "passed" their assigned pair
@@ -1218,26 +1224,38 @@ class MLSimulation:
 
                 # --- TACTICAL COMMAND AT LOCK MOMENT ---
                 if not self._command_issued:
-                    # Prepare cluster data with enemy IDs (not indices!)
-                    clusters_data = []
-                    for m in decision.cluster_metrics:
-                        avg_vx = np.mean([active_enemies[i].vx for i in m.enemy_indices]) if m.enemy_indices else 0
-                        avg_vy = np.mean([active_enemies[i].vy for i in m.enemy_indices]) if m.enemy_indices else 0
-                        # Convert indices to actual enemy IDs for stable targeting
-                        enemy_ids = [active_enemies[i].id for i in m.enemy_indices if i < len(active_enemies)]
-                        clusters_data.append({
-                            'cluster_id': m.cluster_id,
-                            'center': m.center,
-                            'count': m.size,
-                            'velocity': (avg_vx, avg_vy),
-                            'enemy_indices': m.enemy_indices,
-                            'enemy_ids': enemy_ids,  # Actual enemy IDs for targeting
-                        })
+                    # For DYNAMIC mode, just mark as issued - actual assignment happens every frame
+                    if self._assignment_mode == AssignmentMode.ORTOOLS_DYNAMIC:
+                        self._command_issued = True
+                        print("\n" + "=" * 60)
+                        print("【OR-Tools DYNAMIC MODE ACTIVATED】")
+                        print("=" * 60)
+                        print(f"Formation: {decision.formation_class.name} (Confidence: {decision.confidence:.1%})")
+                        print(f"Mode: Dynamic reassignment every {self._dynamic_update_interval}s")
+                        print("NOTE: Pair-enemy mapping will be recalculated continuously!")
+                        print("=" * 60 + "\n")
+                    else:
+                        # Static modes (ortools, llm, scipy): Use cluster-based assignment
+                        # Prepare cluster data with enemy IDs (not indices!)
+                        clusters_data = []
+                        for m in decision.cluster_metrics:
+                            avg_vx = np.mean([active_enemies[i].vx for i in m.enemy_indices]) if m.enemy_indices else 0
+                            avg_vy = np.mean([active_enemies[i].vy for i in m.enemy_indices]) if m.enemy_indices else 0
+                            # Convert indices to actual enemy IDs for stable targeting
+                            enemy_ids = [active_enemies[i].id for i in m.enemy_indices if i < len(active_enemies)]
+                            clusters_data.append({
+                                'cluster_id': m.cluster_id,
+                                'center': m.center,
+                                'count': m.size,
+                                'velocity': (avg_vx, avg_vy),
+                                'enemy_indices': m.enemy_indices,
+                                'enemy_ids': enemy_ids,  # Actual enemy IDs for targeting
+                            })
 
-                    self._issue_tactical_command(
-                        pairs, clusters_data,
-                        decision.formation_class, decision.confidence
-                    )
+                        self._issue_tactical_command(
+                            pairs, clusters_data,
+                            decision.formation_class, decision.confidence
+                        )
             else:
                 self._formation_name = "ANALYZING..."
                 self._confidence = 0.0
@@ -1254,145 +1272,206 @@ class MLSimulation:
 
             # --- FRIENDLY MOVEMENT (only after tactical command) ---
             if self._command_issued:
-                # Clean up targeted enemies set (remove dead enemies)
-                self._targeted_enemies = {
-                    eid for eid in self._targeted_enemies
-                    if any(e.id == eid and e.is_active for e in self.enemies)
-                }
+                # === DYNAMIC MODE: Recalculate optimal assignment every interval ===
+                if self._assignment_mode == AssignmentMode.ORTOOLS_DYNAMIC:
+                    time_since_update = self.sim_time - self._last_dynamic_update
+                    if time_since_update >= self._dynamic_update_interval:
+                        self._last_dynamic_update = self.sim_time
 
-                # Move friendlies based on pair-cluster assignments
-                # Pairs without assignment stay as RESERVE (stationary)
-                for pair_idx, (f1, f2) in enumerate(pairs):
-                    net_spacing = NET_SPACING_BASE
-                    pair_center = np.array([(f1.x + f2.x) / 2, (f1.y + f2.y) / 2])
+                        # Prepare agent data
+                        agents_data = []
+                        for pair_idx, (f1, f2) in enumerate(pairs):
+                            center_x = (f1.x + f2.x) / 2
+                            center_y = (f1.y + f2.y) / 2
+                            heading = math.degrees(f1.heading)
+                            agents_data.append({
+                                'id': pair_idx,
+                                'pos': (center_x, center_y),
+                                'angle': heading,
+                            })
 
-                    # Check if this pair has a cluster assignment
-                    assigned_cluster_id = self._pair_assignments.get(pair_idx)
+                        # Get dynamic assignment
+                        new_assignments, changes, reasoning = get_dynamic_assignment(
+                            agents_data,
+                            active_enemies,
+                            decision.formation_class,
+                            CONFIG["defense_center"],
+                            self._dynamic_assignments,
+                            verbose=False,  # Enable verbose in log below when changes occur
+                        )
 
-                    # === NO ASSIGNMENT = RESERVE UNIT (stay stationary) ===
-                    if assigned_cluster_id is None:
-                        # No cluster assigned - this pair is reserve, stay put
-                        f1.vx = f1.vy = 0
-                        f2.vx = f2.vy = 0
-                        self._pair_targets[pair_idx] = None
-                        continue
+                        # Update assignments
+                        self._dynamic_assignments = new_assignments
 
-                    # === RETURNING TO HOME POSITION ===
-                    if assigned_cluster_id == RETURNING_HOME_CLUSTER_ID:
-                        home_pos = self._pair_home_positions.get(pair_idx)
-                        if home_pos is not None:
-                            (home_f1_x, home_f1_y), (home_f2_x, home_f2_y) = home_pos
-
-                            # Check if arrived at home
-                            dist_f1 = math.sqrt((f1.x - home_f1_x)**2 + (f1.y - home_f1_y)**2)
-                            dist_f2 = math.sqrt((f2.x - home_f2_x)**2 + (f2.y - home_f2_y)**2)
-
-                            if dist_f1 <= HOME_ARRIVAL_THRESHOLD and dist_f2 <= HOME_ARRIVAL_THRESHOLD:
-                                # Arrived at home - become reserve
-                                print(f"[HOME] Pair {pair_idx} arrived at home position, now RESERVE")
-                                self._pair_assignments[pair_idx] = None
-                                self._pair_targets[pair_idx] = None
-                                f1.vx = f1.vy = 0
-                                f2.vx = f2.vy = 0
-                                # Snap to exact home position
-                                f1.x, f1.y = home_f1_x, home_f1_y
-                                f2.x, f2.y = home_f2_x, home_f2_y
+                        # Update pair targets based on new assignments
+                        for pair_idx in range(len(pairs)):
+                            enemy_id = new_assignments.get(pair_idx)
+                            if enemy_id is not None:
+                                target_enemy = next(
+                                    (e for e in active_enemies if e.id == enemy_id),
+                                    None
+                                )
+                                self._pair_targets[pair_idx] = target_enemy
                             else:
-                                # Still returning - move toward home
-                                f1.set_velocity_towards(home_f1_x, home_f1_y, CONFIG["friendly_speed"])
-                                f2.set_velocity_towards(home_f2_x, home_f2_y, CONFIG["friendly_speed"])
-                                # Log occasionally
-                                if int(self.sim_time * 10) % 50 == 0:
-                                    print(f"[RETURN] Pair {pair_idx} returning home, dist=({dist_f1:.0f}m, {dist_f2:.0f}m)")
-                        continue
+                                self._pair_targets[pair_idx] = None
 
-                    # === REASSIGNED PAIR (chasing missed/escaped/post-capture enemy) ===
-                    # Negative cluster_id indicates direct enemy assignment:
-                    #   -1x = missed enemy, -2x = escaped enemy, -3x = post-capture reassignment
-                    if assigned_cluster_id < 0:
-                        # This pair was reassigned to chase a specific missed/escaped enemy
-                        # The target is already set in _pair_targets by _check_and_reassign_missed_enemies
+                        # Log changes
+                        if changes:
+                            print(f"[DYNAMIC t={self.sim_time:.1f}] {len(changes)} reassignments: {changes}")
+
+                    # Move friendlies based on dynamic pair-enemy assignments
+                    for pair_idx, (f1, f2) in enumerate(pairs):
                         target_enemy = self._pair_targets.get(pair_idx)
+                        net_spacing = NET_SPACING_BASE
+
                         if target_enemy is not None and target_enemy.is_active:
-                            # Log chase status occasionally
-                            if int(self.sim_time * 10) % 50 == 0:  # Every 5 seconds
-                                pair_center = ((f1.x + f2.x) / 2, (f1.y + f2.y) / 2)
-                                dist = math.sqrt((target_enemy.x - pair_center[0])**2 + (target_enemy.y - pair_center[1])**2)
-                                print(f"[CHASE] Reassigned Pair {pair_idx} -> Enemy {target_enemy.id}, dist={dist:.0f}m")
                             self._update_pair_direct_chase(f1, f2, target_enemy, net_spacing)
                         else:
-                            # Target was neutralized - return to home position
-                            print(f"[RETURN] Pair {pair_idx} mission complete, returning to HOME")
-                            self._pair_assignments[pair_idx] = RETURNING_HOME_CLUSTER_ID
+                            # No target - stay stationary
+                            f1.vx = f1.vy = 0
+                            f2.vx = f2.vy = 0
+
+                # === STATIC MODES (ortools, llm, scipy) - Skip for dynamic mode ===
+                if self._assignment_mode != AssignmentMode.ORTOOLS_DYNAMIC:
+                    # Clean up targeted enemies set (remove dead enemies)
+                    self._targeted_enemies = {
+                        eid for eid in self._targeted_enemies
+                        if any(e.id == eid and e.is_active for e in self.enemies)
+                    }
+
+                    # Move friendlies based on pair-cluster assignments (STATIC MODE ONLY)
+                    # Pairs without assignment stay as RESERVE (stationary)
+                    for pair_idx, (f1, f2) in enumerate(pairs):
+                        net_spacing = NET_SPACING_BASE
+                        pair_center = np.array([(f1.x + f2.x) / 2, (f1.y + f2.y) / 2])
+
+                        # Check if this pair has a cluster assignment
+                        assigned_cluster_id = self._pair_assignments.get(pair_idx)
+
+                        # === NO ASSIGNMENT = RESERVE UNIT (stay stationary) ===
+                        if assigned_cluster_id is None:
+                            # No cluster assigned - this pair is reserve, stay put
+                            f1.vx = f1.vy = 0
+                            f2.vx = f2.vy = 0
                             self._pair_targets[pair_idx] = None
-                        continue
+                            continue
 
-                    # === FIXED TARGET LOGIC with UNIQUE TARGETING ===
-                    # Check if current target is still alive
-                    current_target = self._pair_targets.get(pair_idx)
-                    if current_target is not None and current_target.is_active:
-                        # Keep chasing the same target (NO CHANGE)
-                        target_enemy = current_target
-                    else:
-                        # Remove old target from targeted set if it died
-                        if current_target is not None:
-                            self._targeted_enemies.discard(current_target.id)
+                        # === RETURNING TO HOME POSITION ===
+                        if assigned_cluster_id == RETURNING_HOME_CLUSTER_ID:
+                            home_pos = self._pair_home_positions.get(pair_idx)
+                            if home_pos is not None:
+                                (home_f1_x, home_f1_y), (home_f2_x, home_f2_y) = home_pos
 
-                        # Need new target: either first assignment or target died
-                        target_enemy = None
+                                # Check if arrived at home
+                                dist_f1 = math.sqrt((f1.x - home_f1_x)**2 + (f1.y - home_f1_y)**2)
+                                dist_f2 = math.sqrt((f2.x - home_f2_x)**2 + (f2.y - home_f2_y)**2)
 
-                        if len(active_enemies) > 0:
-                            # Get enemy IDs that belong to this cluster (from DBSCAN at lock time)
-                            cluster_enemy_ids = self._cluster_enemy_ids.get(int(assigned_cluster_id), set())
+                                if dist_f1 <= HOME_ARRIVAL_THRESHOLD and dist_f2 <= HOME_ARRIVAL_THRESHOLD:
+                                    # Arrived at home - become reserve
+                                    print(f"[HOME] Pair {pair_idx} arrived at home position, now RESERVE")
+                                    self._pair_assignments[pair_idx] = None
+                                    self._pair_targets[pair_idx] = None
+                                    f1.vx = f1.vy = 0
+                                    f2.vx = f2.vy = 0
+                                    # Snap to exact home position
+                                    f1.x, f1.y = home_f1_x, home_f1_y
+                                    f2.x, f2.y = home_f2_x, home_f2_y
+                                else:
+                                    # Still returning - move toward home
+                                    f1.set_velocity_towards(home_f1_x, home_f1_y, CONFIG["friendly_speed"])
+                                    f2.set_velocity_towards(home_f2_x, home_f2_y, CONFIG["friendly_speed"])
+                                    # Log occasionally
+                                    if int(self.sim_time * 10) % 50 == 0:
+                                        print(f"[RETURN] Pair {pair_idx} returning home, dist=({dist_f1:.0f}m, {dist_f2:.0f}m)")
+                            continue
 
-                            # Find closest UNTARGETED enemy in the assigned cluster ONLY
-                            min_dist = float('inf')
-                            for e in active_enemies:
-                                # Only consider enemies that belong to this cluster
-                                if e.id not in cluster_enemy_ids:
-                                    continue
-                                # Skip already targeted enemies (unique 1:1 targeting)
-                                if e.id in self._targeted_enemies:
-                                    continue
-                                if e.is_active:
-                                    dist_to_pair = np.linalg.norm([
-                                        e.x - pair_center[0],
-                                        e.y - pair_center[1]
-                                    ])
-                                    if dist_to_pair < min_dist:
-                                        min_dist = dist_to_pair
-                                        target_enemy = e
+                        # === REASSIGNED PAIR (chasing missed/escaped/post-capture enemy) ===
+                        # Negative cluster_id indicates direct enemy assignment:
+                        #   -1x = missed enemy, -2x = escaped enemy, -3x = post-capture reassignment
+                        if assigned_cluster_id < 0:
+                            # This pair was reassigned to chase a specific missed/escaped enemy
+                            # The target is already set in _pair_targets by _check_and_reassign_missed_enemies
+                            target_enemy = self._pair_targets.get(pair_idx)
+                            if target_enemy is not None and target_enemy.is_active:
+                                # Log chase status occasionally
+                                if int(self.sim_time * 10) % 50 == 0:  # Every 5 seconds
+                                    pair_center = ((f1.x + f2.x) / 2, (f1.y + f2.y) / 2)
+                                    dist = math.sqrt((target_enemy.x - pair_center[0])**2 + (target_enemy.y - pair_center[1])**2)
+                                    print(f"[CHASE] Reassigned Pair {pair_idx} -> Enemy {target_enemy.id}, dist={dist:.0f}m")
+                                self._update_pair_direct_chase(f1, f2, target_enemy, net_spacing)
+                            else:
+                                # Target was neutralized - return to home position
+                                print(f"[RETURN] Pair {pair_idx} mission complete, returning to HOME")
+                                self._pair_assignments[pair_idx] = RETURNING_HOME_CLUSTER_ID
+                                self._pair_targets[pair_idx] = None
+                            continue
 
-                        # NO FALLBACK: If cluster exhausted, stay stationary (don't chase other clusters)
-                        # This pair completed its mission or is waiting for reassignment
+                        # === FIXED TARGET LOGIC with UNIQUE TARGETING ===
+                        # Check if current target is still alive
+                        current_target = self._pair_targets.get(pair_idx)
+                        if current_target is not None and current_target.is_active:
+                            # Keep chasing the same target (NO CHANGE)
+                            target_enemy = current_target
+                        else:
+                            # Remove old target from targeted set if it died
+                            if current_target is not None:
+                                self._targeted_enemies.discard(current_target.id)
 
-                        # Log new target assignment and mark as targeted
+                            # Need new target: either first assignment or target died
+                            target_enemy = None
+
+                            if len(active_enemies) > 0:
+                                # Get enemy IDs that belong to this cluster (from DBSCAN at lock time)
+                                cluster_enemy_ids = self._cluster_enemy_ids.get(int(assigned_cluster_id), set())
+
+                                # Find closest UNTARGETED enemy in the assigned cluster ONLY
+                                min_dist = float('inf')
+                                for e in active_enemies:
+                                    # Only consider enemies that belong to this cluster
+                                    if e.id not in cluster_enemy_ids:
+                                        continue
+                                    # Skip already targeted enemies (unique 1:1 targeting)
+                                    if e.id in self._targeted_enemies:
+                                        continue
+                                    if e.is_active:
+                                        dist_to_pair = np.linalg.norm([
+                                            e.x - pair_center[0],
+                                            e.y - pair_center[1]
+                                        ])
+                                        if dist_to_pair < min_dist:
+                                            min_dist = dist_to_pair
+                                            target_enemy = e
+
+                            # NO FALLBACK: If cluster exhausted, stay stationary (don't chase other clusters)
+                            # This pair completed its mission or is waiting for reassignment
+
+                            # Log new target assignment and mark as targeted
+                            if target_enemy is not None:
+                                old_id = current_target.id if current_target else "None"
+                                self._targeted_enemies.add(target_enemy.id)
+                                print(f"[Target] Pair {pair_idx}: {old_id} -> Enemy {target_enemy.id} (Cluster {assigned_cluster_id})")
+
+                        # Store target (only changes when target dies)
+                        self._pair_targets[pair_idx] = target_enemy
+
+                        # Update friendly pair movement - DIRECT CHASE
                         if target_enemy is not None:
-                            old_id = current_target.id if current_target else "None"
-                            self._targeted_enemies.add(target_enemy.id)
-                            print(f"[Target] Pair {pair_idx}: {old_id} -> Enemy {target_enemy.id} (Cluster {assigned_cluster_id})")
+                            self._update_pair_direct_chase(
+                                f1, f2, target_enemy, net_spacing
+                            )
+                        else:
+                            # Cluster exhausted (all enemies dead/targeted) - stay stationary
+                            # This pair completed its mission, waiting as reserve
+                            f1.vx = f1.vy = 0
+                            f2.vx = f2.vy = 0
 
-                    # Store target (only changes when target dies)
-                    self._pair_targets[pair_idx] = target_enemy
+                    # === CHECK FOR MISSED ENEMIES AND REASSIGN TO RESERVES ===
+                    # An enemy is "missed" if it's closer to mothership than its assigned pair
+                    self._check_and_reassign_missed_enemies(pairs)
 
-                    # Update friendly pair movement - DIRECT CHASE
-                    if target_enemy is not None:
-                        self._update_pair_direct_chase(
-                            f1, f2, target_enemy, net_spacing
-                        )
-                    else:
-                        # Cluster exhausted (all enemies dead/targeted) - stay stationary
-                        # This pair completed its mission, waiting as reserve
-                        f1.vx = f1.vy = 0
-                        f2.vx = f2.vy = 0
-
-                # === CHECK FOR MISSED ENEMIES AND REASSIGN TO RESERVES ===
-                # An enemy is "missed" if it's closer to mothership than its assigned pair
-                self._check_and_reassign_missed_enemies(pairs)
-
-                # === CHECK FOR ESCAPED ENEMIES ===
-                # An enemy is "escaped" if it moves beyond ESCAPE_DISTANCE_THRESHOLD from cluster center
-                self._check_escaped_enemies(pairs)
+                    # === CHECK FOR ESCAPED ENEMIES ===
+                    # An enemy is "escaped" if it moves beyond ESCAPE_DISTANCE_THRESHOLD from cluster center
+                    self._check_escaped_enemies(pairs)
 
             # else: Friendlies stay stationary (vx=vy=0) until tactical command
         else:
@@ -1743,27 +1822,35 @@ def main():
         num_pairs = max(2, min(12, num_pairs))
 
         print("\n【Assignment Mode Selection】")
-        print("1. OR-Tools Optimal (default) - Fast, deterministic, guaranteed 1:1 mapping")
-        print("2. LLM Tactical - Uses Ollama LLM for tactical reasoning")
-        print("3. Scipy Hungarian - Fallback mode using scipy")
+        print("1. OR-Tools Static (default) - Lock assignment at 5km, fixed targets")
+        print("2. OR-Tools Dynamic - Recalculate optimal assignment every 5 seconds")
+        print("3. LLM Tactical - Uses Ollama LLM for tactical reasoning")
+        print("4. Scipy Hungarian - Fallback mode using scipy")
         print("-" * 40)
 
-        mode_input = input("Select assignment mode (1-3) [default: 1]: ").strip()
+        mode_input = input("Select assignment mode (1-4) [default: 1]: ").strip()
         if mode_input == "" or mode_input == "1":
             assignment_mode = AssignmentMode.ORTOOLS
         elif mode_input == "2":
-            assignment_mode = AssignmentMode.LLM
+            assignment_mode = AssignmentMode.ORTOOLS_DYNAMIC
         elif mode_input == "3":
+            assignment_mode = AssignmentMode.LLM
+        elif mode_input == "4":
             assignment_mode = AssignmentMode.SCIPY
         else:
-            print("Invalid choice, using OR-Tools")
+            print("Invalid choice, using OR-Tools Static")
             assignment_mode = AssignmentMode.ORTOOLS
 
         if assignment_mode == AssignmentMode.ORTOOLS:
-            print("\n【OR-Tools Mode (Default)】")
+            print("\n【OR-Tools Static Mode (Default)】")
             print("  - Linear Sum Assignment for optimal 1:1 mapping")
+            print("  - Assignment locked at 5km, targets fixed until neutralized")
             print("  - Uses effective distance: distance + |angle| × 1.5")
-            print("  - Deterministic results, no variability")
+        elif assignment_mode == AssignmentMode.ORTOOLS_DYNAMIC:
+            print("\n【OR-Tools Dynamic Mode】")
+            print("  - Recalculates optimal pair-enemy assignment every 3 seconds")
+            print("  - Pairs switch targets dynamically for best efficiency")
+            print("  - Uses effective distance: distance + |angle| × 1.5")
         elif assignment_mode == AssignmentMode.LLM:
             print("\n【LLM Mode】")
             print("  - Recommended model: qwen2.5:7b-instruct (via Ollama)")
@@ -1781,7 +1868,8 @@ def main():
         assignment_mode = AssignmentMode.ORTOOLS
 
     mode_label = {
-        AssignmentMode.ORTOOLS: "OR-Tools Optimal",
+        AssignmentMode.ORTOOLS: "OR-Tools Static",
+        AssignmentMode.ORTOOLS_DYNAMIC: "OR-Tools Dynamic",
         AssignmentMode.LLM: "LLM Tactical",
         AssignmentMode.SCIPY: "Scipy Hungarian",
     }.get(assignment_mode, assignment_mode)

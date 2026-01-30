@@ -411,7 +411,8 @@ def get_optimal_assignment(
 
 class AssignmentMode:
     """Assignment mode enumeration."""
-    ORTOOLS = "ortools"
+    ORTOOLS = "ortools"              # Static: Lock assignment at 5km, never change
+    ORTOOLS_DYNAMIC = "ortools_dynamic"  # Dynamic: Recalculate optimal assignment every frame
     LLM = "llm"
     SCIPY = "scipy"  # Fallback only
 
@@ -461,3 +462,157 @@ def get_tactical_assignment(
         return get_optimal_assignment(
             agents, clusters, formation, confidence, defense_center
         )
+
+
+# =============================================================================
+# DYNAMIC REASSIGNMENT (ORTOOLS_DYNAMIC MODE)
+# =============================================================================
+
+def compute_dynamic_assignment(
+    agents: List[Dict],
+    active_enemies: List[Dict],
+    formation: FormationClass = FormationClass.DIVERSIONARY,
+    defense_center: Tuple[float, float] = DEFENSE_CENTER,
+    previous_assignments: Optional[Dict[int, int]] = None,
+    verbose: bool = False,
+) -> Tuple[Dict[int, int], Dict[int, int], str]:
+    """
+    Compute optimal pair-to-enemy assignment dynamically.
+
+    This is called every frame (or periodically) to recalculate the best
+    assignment based on current positions of pairs and enemies.
+
+    Key differences from static mode:
+      - Assigns pairs directly to INDIVIDUAL ENEMIES (not clusters)
+      - Recalculates every frame based on current positions
+      - Returns both pair->enemy mapping and changes from previous frame
+
+    Args:
+        agents: List of agent dicts with 'id', 'pos', 'angle'
+        active_enemies: List of active enemy dicts with 'id', 'pos', 'velocity'
+        formation: Formation type for ETA weighting
+        defense_center: Defense center position
+        previous_assignments: Previous frame's assignments for change detection
+        verbose: Whether to print debug info
+
+    Returns:
+        Tuple of:
+          - assignments: Dict[pair_id, enemy_id] - current optimal assignment
+          - changes: Dict[pair_id, enemy_id] - pairs that changed assignment
+          - reasoning: Human-readable explanation
+    """
+    if not agents or not active_enemies:
+        return {}, {}, "No agents or enemies to assign"
+
+    n_agents = len(agents)
+    n_enemies = len(active_enemies)
+
+    # Build cost matrix: pairs (rows) vs enemies (columns)
+    cost_matrix = np.zeros((n_agents, n_enemies))
+
+    # ETA weight based on formation
+    if formation == FormationClass.CONCENTRATED:
+        eta_weight = 0.2
+    elif formation == FormationClass.WAVE:
+        eta_weight = 0.4
+    else:
+        eta_weight = 0.2
+
+    for i, agent in enumerate(agents):
+        pos = tuple(agent['pos'])
+        heading = agent['angle']
+
+        for j, enemy in enumerate(active_enemies):
+            enemy_pos = tuple(enemy['pos'])
+            enemy_vel = tuple(enemy.get('velocity', (0, 0)))
+
+            # Effective distance (primary cost)
+            eff_dist = calculate_effective_distance(
+                pos, heading, enemy_pos, angle_weight=1.5
+            )
+
+            # ETA factor (secondary cost)
+            eta_factor = calculate_eta_factor(
+                enemy_pos, enemy_vel, defense_center
+            )
+            eta_penalty = (1.0 - eta_factor) * 500
+
+            cost_matrix[i, j] = eff_dist + eta_weight * eta_penalty
+
+    # Pad to square matrix
+    size = max(n_agents, n_enemies)
+    padded_cost = np.full((size, size), 1e9)
+    padded_cost[:n_agents, :n_enemies] = cost_matrix
+
+    # Solve using scipy (faster for frequent calls)
+    from scipy.optimize import linear_sum_assignment
+    row_ind, col_ind = linear_sum_assignment(padded_cost)
+
+    # Build assignment map: pair_id -> enemy_id
+    assignments = {}
+    total_cost = 0.0
+
+    for r, c in zip(row_ind, col_ind):
+        if r < n_agents and c < n_enemies:
+            pair_id = agents[r]['id']
+            enemy_id = active_enemies[c]['id']
+            assignments[pair_id] = enemy_id
+            total_cost += cost_matrix[r, c]
+
+    # Detect changes from previous assignment
+    changes = {}
+    if previous_assignments is not None:
+        for pair_id, enemy_id in assignments.items():
+            prev_enemy = previous_assignments.get(pair_id)
+            if prev_enemy != enemy_id:
+                changes[pair_id] = enemy_id
+                if verbose:
+                    print(f"[DYNAMIC] Pair {pair_id}: Enemy {prev_enemy} -> Enemy {enemy_id}")
+
+    # Build reasoning
+    n_changes = len(changes)
+    if n_changes > 0:
+        reasoning = f"Dynamic reassignment: {n_changes} pairs changed targets. Total cost: {total_cost:.1f}"
+    else:
+        reasoning = f"Dynamic assignment stable. Total cost: {total_cost:.1f}"
+
+    return assignments, changes, reasoning
+
+
+def get_dynamic_assignment(
+    agents: List[Dict],
+    active_enemies: List['USV'],  # Actual USV objects
+    formation: FormationClass = FormationClass.DIVERSIONARY,
+    defense_center: Tuple[float, float] = DEFENSE_CENTER,
+    previous_assignments: Optional[Dict[int, int]] = None,
+    verbose: bool = False,
+) -> Tuple[Dict[int, int], Dict[int, int], str]:
+    """
+    High-level wrapper for dynamic assignment from USV objects.
+
+    Converts USV objects to dict format and calls compute_dynamic_assignment.
+
+    Args:
+        agents: List of agent dicts with 'id', 'pos', 'angle'
+        active_enemies: List of active USV enemy objects
+        formation: Formation type
+        defense_center: Defense center position
+        previous_assignments: Previous frame's pair->enemy mapping
+        verbose: Whether to print debug info
+
+    Returns:
+        Tuple of (assignments, changes, reasoning)
+    """
+    # Convert USV objects to dict format
+    enemy_dicts = []
+    for e in active_enemies:
+        enemy_dicts.append({
+            'id': e.id,
+            'pos': (e.x, e.y),
+            'velocity': (e.vx, e.vy),
+        })
+
+    return compute_dynamic_assignment(
+        agents, enemy_dicts, formation, defense_center,
+        previous_assignments, verbose
+    )
