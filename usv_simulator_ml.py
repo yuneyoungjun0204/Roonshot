@@ -23,9 +23,21 @@ import math
 import random
 from typing import List, Tuple, Optional, Dict
 
+# Import centralized parameters
+from PARAM import (
+    CONFIG,
+    DEFENSE_CENTER, NET_SPACING_BASE, MISSED_THRESHOLD, ESCAPE_DISTANCE_THRESHOLD,
+    RETURNING_HOME_CLUSTER_ID, HOME_ARRIVAL_THRESHOLD,
+    POST_CAPTURE_DISTANCE_THRESHOLD, POST_CAPTURE_ANGLE_THRESHOLD,
+    CLUSTER_COLORS, CLUSTER_BOUNDARY_PADDING,
+    PAIR_BASE_PATROL_RADIUS, PAIR_RADIUS_STEP,
+    WAVE_SPAWN_RADIUS as SIM_WAVE_SPAWN_RADIUS,
+    DYNAMIC_UPDATE_INTERVAL,
+    ANGLE_WEIGHT,
+)
+
 # Import original components
 from usv_simulator import (
-    CONFIG,
     AttackPattern,
     USV,
     CaptureEvent,
@@ -39,11 +51,6 @@ from usv_simulator import (
 # Import ML system
 from ml.inference import DefenseMLSystem
 from ml.labels import FormationClass, FORMATION_NAMES
-from ml.constants import (
-    DEFENSE_CENTER, NET_SPACING_BASE, MISSED_THRESHOLD, ESCAPE_DISTANCE_THRESHOLD,
-    RETURNING_HOME_CLUSTER_ID, HOME_ARRIVAL_THRESHOLD,
-    POST_CAPTURE_DISTANCE_THRESHOLD, POST_CAPTURE_ANGLE_THRESHOLD,
-)
 
 # Import LLM Commander
 from ml.llm_commander import LLMCommander, rule_based_mapping, get_tactical_command
@@ -54,6 +61,7 @@ from ml.ortools_assignment import (
     get_tactical_assignment,
     get_optimal_assignment,
     get_dynamic_assignment,
+    VRPAssignmentResult,
 )
 
 
@@ -95,7 +103,7 @@ class MLRenderer(Renderer):
         from scipy.spatial import ConvexHull
 
         unique_labels = set(cluster_labels)
-        padding = 120.0  # world-unit padding around hull
+        padding = CLUSTER_BOUNDARY_PADDING
 
         for cid in unique_labels:
             if cid < 0:
@@ -385,17 +393,7 @@ class MLRenderer(Renderer):
             drawing = not drawing
 
 
-# Cluster colors for visualization
-CLUSTER_COLORS = [
-    (255, 100, 100),   # Red
-    (100, 255, 100),   # Green
-    (100, 100, 255),   # Blue
-    (255, 255, 100),   # Yellow
-    (255, 100, 255),   # Magenta
-    (100, 255, 255),   # Cyan
-    (255, 180, 100),   # Orange
-    (180, 100, 255),   # Purple
-]
+# CLUSTER_COLORS imported from PARAM
 
 
 class MLSimulation:
@@ -454,8 +452,12 @@ class MLSimulation:
 
         # Dynamic mode specific state
         self._dynamic_assignments: Dict[int, int] = {}  # pair_id -> enemy_id (for dynamic mode)
-        self._dynamic_update_interval = 5  # Update interval in seconds (every 3 seconds)
+        self._dynamic_update_interval = DYNAMIC_UPDATE_INTERVAL
         self._last_dynamic_update = 0.0  # Last dynamic update time
+
+        # VRP mode specific state
+        self._pair_routes: Dict[int, List[int]] = {}  # pair_idx -> [enemy_id_1, enemy_id_2, ...]
+        self._pair_route_index: Dict[int, int] = {}   # pair_idx -> current index in route
 
         # Missed enemy tracking and reserve reassignment
         self._missed_enemies: set = set()  # Enemy IDs that have "passed" their assigned pair
@@ -499,9 +501,9 @@ class MLSimulation:
             math.radians(180),   # West
         ]
 
-        base_patrol_radius = 100  # 100m from mothership (close protection)
-        radius_step = 150  # Distance between pairs at same direction
-        net_spacing = 80.0
+        base_patrol_radius = PAIR_BASE_PATROL_RADIUS
+        radius_step = PAIR_RADIUS_STEP
+        net_spacing = NET_SPACING_BASE
         usv_id = 0
 
         # Track how many pairs are placed at each direction
@@ -563,7 +565,7 @@ class MLSimulation:
                 self.num_enemies, spawn_radius, defense_center, world_size
             )
         elif self.attack_pattern == AttackPattern.WAVE:
-            wave_spawn_radius = 7000  # 7km — further out so formation is visible at 5km lock
+            wave_spawn_radius = SIM_WAVE_SPAWN_RADIUS
             enemies_with_timing = AttackPatternGenerator.generate_wave(
                 self.num_enemies, 3, wave_spawn_radius, defense_center, world_size
             )
@@ -745,7 +747,7 @@ class MLSimulation:
                 eff_dist = calculate_effective_distance(
                     pair_center, pair_heading,
                     (missed_enemy.x, missed_enemy.y),
-                    angle_weight=1.5
+                    angle_weight=ANGLE_WEIGHT
                 )
 
                 if eff_dist < best_cost:
@@ -894,7 +896,7 @@ class MLSimulation:
                 eff_dist = calculate_effective_distance(
                     pair_center, pair_heading,
                     (enemy.x, enemy.y),
-                    angle_weight=1.5
+                    angle_weight=ANGLE_WEIGHT
                 )
 
                 if eff_dist < best_cost:
@@ -1032,7 +1034,7 @@ class MLSimulation:
                 other_eff_dist = calculate_effective_distance(
                     other_center, other_heading,
                     (enemy.x, enemy.y),
-                    angle_weight=1.5
+                    angle_weight=ANGLE_WEIGHT
                 )
 
                 print(f"[POST-CAPTURE] Comparing for Enemy {enemy.id}:")
@@ -1069,16 +1071,150 @@ class MLSimulation:
 
         return False  # No suitable candidate found
 
+    def _check_vrp_missed_enemies(
+        self,
+        pairs: List[Tuple[USV, USV]],
+    ):
+        """
+        VRP-specific missed enemy detection and reserve pair deployment.
+
+        Checks if any enemies being tracked by VRP pairs have "passed" them
+        (enemy closer to mothership than pair). If so, finds reserve pairs
+        (empty route, completed route, or returned home) and deploys them.
+        """
+        mothership_pos = CONFIG["mothership_position"]
+
+        # 1. Detect missed enemies
+        newly_missed = []
+        for pair_idx, (f1, f2) in enumerate(pairs):
+            target_enemy = self._pair_targets.get(pair_idx)
+            if target_enemy is None or not target_enemy.is_active:
+                continue
+
+            # Skip if already marked as missed
+            if target_enemy.id in self._missed_enemies:
+                continue
+
+            # Skip reserve/reassigned pairs (negative cluster_id) - they're already chasing
+            assigned = self._pair_assignments.get(pair_idx)
+            if assigned is not None and assigned < 0:
+                continue
+
+            # Calculate distances to mothership
+            pair_center_x = (f1.x + f2.x) / 2
+            pair_center_y = (f1.y + f2.y) / 2
+            pair_dist = math.sqrt(
+                (pair_center_x - mothership_pos[0])**2 +
+                (pair_center_y - mothership_pos[1])**2
+            )
+            enemy_dist = math.sqrt(
+                (target_enemy.x - mothership_pos[0])**2 +
+                (target_enemy.y - mothership_pos[1])**2
+            )
+
+            if enemy_dist < pair_dist - MISSED_THRESHOLD:
+                newly_missed.append((pair_idx, target_enemy))
+                self._missed_enemies.add(target_enemy.id)
+                print(f"[VRP-MISSED] Enemy {target_enemy.id} passed Pair {pair_idx}!")
+                print(f"             enemy_dist={enemy_dist:.0f}m < pair_dist={pair_dist:.0f}m")
+
+        if not newly_missed:
+            return
+
+        # 2. Find VRP reserve pairs: empty route, completed route, or returned home
+        pairs_that_missed = {idx for idx, _ in newly_missed}
+        reserve_pairs = []
+        for pair_idx, (f1, f2) in enumerate(pairs):
+            if pair_idx in pairs_that_missed:
+                continue
+
+            assigned = self._pair_assignments.get(pair_idx)
+            route = self._pair_routes.get(pair_idx, [])
+            route_idx = self._pair_route_index.get(pair_idx, 0)
+
+            # Reserve conditions:
+            # 1) No assignment at all (was reserve from start)
+            # 2) Completed route and returned home (assignment = None after arriving)
+            # 3) Returning home (can be intercepted)
+            is_reserve = (
+                assigned is None or
+                assigned == RETURNING_HOME_CLUSTER_ID or
+                (len(route) == 0 and (assigned is None or assigned >= 0))
+            )
+
+            # Also: completed route but not yet marked as returning
+            if not is_reserve and route_idx >= len(route) and len(route) > 0:
+                is_reserve = True
+
+            if is_reserve:
+                reserve_pairs.append(pair_idx)
+
+        if not reserve_pairs:
+            print(f"[VRP-MISSED] No reserve pairs for {len(newly_missed)} missed enemies!")
+            return
+
+        print(f"[VRP-DEPLOY] {len(newly_missed)} missed enemies, {len(reserve_pairs)} reserve pairs: {reserve_pairs}")
+
+        # 3. Deploy reserve pairs to chase missed enemies
+        from ml.ortools_assignment import calculate_effective_distance
+
+        for _, missed_enemy in newly_missed:
+            if not reserve_pairs:
+                print(f"[VRP-DEPLOY] No more reserve pairs for Enemy {missed_enemy.id}")
+                break
+
+            best_pair_idx = None
+            best_cost = float('inf')
+
+            for reserve_idx in reserve_pairs:
+                f1, f2 = pairs[reserve_idx]
+                pair_center = ((f1.x + f2.x) / 2, (f1.y + f2.y) / 2)
+                pair_heading = math.degrees(f1.heading)
+
+                eff_dist = calculate_effective_distance(
+                    pair_center, pair_heading,
+                    (missed_enemy.x, missed_enemy.y),
+                    angle_weight=ANGLE_WEIGHT
+                )
+
+                if eff_dist < best_cost:
+                    best_cost = eff_dist
+                    best_pair_idx = reserve_idx
+
+            if best_pair_idx is not None:
+                # Clear old target if any
+                old_target = self._pair_targets.get(best_pair_idx)
+                if old_target and old_target.id in self._targeted_enemies:
+                    self._targeted_enemies.discard(old_target.id)
+
+                # Assign missed enemy to reserve pair
+                self._pair_targets[best_pair_idx] = missed_enemy
+                self._targeted_enemies.add(missed_enemy.id)
+
+                # Mark with negative cluster_id (same convention as static mode)
+                virtual_cluster_id = -1 * missed_enemy.id
+                self._pair_assignments[best_pair_idx] = virtual_cluster_id
+
+                reserve_pairs.remove(best_pair_idx)
+
+                f1_res, f2_res = pairs[best_pair_idx]
+                res_center = ((f1_res.x + f2_res.x) / 2, (f1_res.y + f2_res.y) / 2)
+                print(f"[VRP-DEPLOY] Reserve Pair {best_pair_idx} DEPLOYED -> Enemy {missed_enemy.id}")
+                print(f"             Pair pos: ({res_center[0]:.0f}, {res_center[1]:.0f})")
+                print(f"             Enemy pos: ({missed_enemy.x:.0f}, {missed_enemy.y:.0f})")
+                print(f"             Effective distance: {best_cost:.1f}")
+
     def _issue_tactical_command(
         self,
         pairs: List[Tuple[USV, USV]],
         clusters_data: List[Dict],
         formation: FormationClass,
         confidence: float,
+        active_enemies: Optional[List[USV]] = None,
     ):
         """
         Issue tactical command for pair-to-cluster mapping.
-        Uses OR-Tools (default), LLM, or scipy based on assignment_mode.
+        Uses OR-Tools (default), VRP, LLM, or scipy based on assignment_mode.
         Called ONCE when formation lock is triggered.
         """
         if self._command_issued:
@@ -1107,6 +1243,85 @@ class MLSimulation:
             enemy_ids = cluster.get('enemy_ids', [])
             self._cluster_enemy_ids[cid] = set(enemy_ids)
 
+        # === VRP MODE: Multi-target route assignment ===
+        if self._assignment_mode == AssignmentMode.ORTOOLS_VRP:
+            try:
+                # Prepare enemy data for VRP
+                enemies_data = []
+                if active_enemies:
+                    for e in active_enemies:
+                        enemies_data.append({
+                            'id': e.id,
+                            'pos': (e.x, e.y),
+                            'velocity': (e.vx, e.vy),
+                        })
+
+                vrp_result, reasoning = get_tactical_assignment(
+                    agents=agents_data,
+                    clusters=clusters_data,
+                    formation=formation,
+                    confidence=confidence,
+                    mode=self._assignment_mode,
+                    enemies=enemies_data,
+                )
+
+                # VRP returns VRPAssignmentResult object
+                self._pair_routes = vrp_result.pair_routes
+                self._pair_route_index = {pid: 0 for pid in self._pair_routes}
+                self._assignment_reasoning = reasoning
+                self._command_issued = True
+
+                print("\n" + "=" * 60)
+                print("【OR-Tools VRP MULTI-TARGET ASSIGNMENT ISSUED - LOCKED】")
+                print("=" * 60)
+                print(f"Formation: {formation.name} (Confidence: {confidence:.1%})")
+                print(f"Pairs: {len(agents_data)}, Enemies: {len(enemies_data)}")
+                print(f"Total Cost: {vrp_result.total_cost:.1f}")
+                print("-" * 40)
+                print("Routes (sequential targets per pair):")
+                for pair_id, route in sorted(self._pair_routes.items()):
+                    print(f"  Pair {pair_id} -> {route} ({len(route)} targets)")
+                print("=" * 60)
+                print("NOTE: Each pair will neutralize targets IN ORDER!")
+                print("=" * 60 + "\n")
+
+                # Set initial targets and identify reserve pairs
+                reserve_pairs = []
+                for pair_idx, route in self._pair_routes.items():
+                    if route:
+                        first_enemy_id = route[0]
+                        target = next((e for e in self.enemies if e.id == first_enemy_id), None)
+                        if target:
+                            self._pair_targets[pair_idx] = target
+                            self._targeted_enemies.add(target.id)
+                            self._pair_assignments[pair_idx] = pair_idx  # Mark as active (positive ID)
+                    else:
+                        # Empty route = RESERVE pair
+                        self._pair_assignments[pair_idx] = None
+                        reserve_pairs.append(pair_idx)
+
+                if reserve_pairs:
+                    print(f"RESERVE PAIRS (empty routes, ready for deployment): {reserve_pairs}")
+
+            except Exception as e:
+                print(f"[VRP Command] Error: {e}, using greedy VRP fallback")
+                from ml.ortools_assignment import greedy_vrp_fallback
+                enemies_data = []
+                if active_enemies:
+                    for e in active_enemies:
+                        enemies_data.append({
+                            'id': e.id,
+                            'pos': (e.x, e.y),
+                            'velocity': (e.vx, e.vy),
+                        })
+                result = greedy_vrp_fallback(agents_data, enemies_data, formation)
+                self._pair_routes = result.pair_routes
+                self._pair_route_index = {pid: 0 for pid in self._pair_routes}
+                self._assignment_reasoning = f"Greedy VRP fallback: {e}"
+                self._command_issued = True
+            return
+
+        # === STANDARD MODES (ortools, llm, scipy) ===
         # Get tactical assignment based on mode
         try:
             assignments, reasoning = get_tactical_assignment(
@@ -1254,7 +1469,8 @@ class MLSimulation:
 
                         self._issue_tactical_command(
                             pairs, clusters_data,
-                            decision.formation_class, decision.confidence
+                            decision.formation_class, decision.confidence,
+                            active_enemies=active_enemies,
                         )
             else:
                 self._formation_name = "ANALYZING..."
@@ -1331,8 +1547,86 @@ class MLSimulation:
                             f1.vx = f1.vy = 0
                             f2.vx = f2.vy = 0
 
-                # === STATIC MODES (ortools, llm, scipy) - Skip for dynamic mode ===
-                if self._assignment_mode != AssignmentMode.ORTOOLS_DYNAMIC:
+                # === VRP MODE: Follow pre-computed routes sequentially ===
+                elif self._assignment_mode == AssignmentMode.ORTOOLS_VRP:
+                    for pair_idx, (f1, f2) in enumerate(pairs):
+                        net_spacing = NET_SPACING_BASE
+                        assigned_cluster_id = self._pair_assignments.get(pair_idx)
+
+                        # === RETURNING TO HOME POSITION ===
+                        if assigned_cluster_id == RETURNING_HOME_CLUSTER_ID:
+                            home_pos = self._pair_home_positions.get(pair_idx)
+                            if home_pos is not None:
+                                (home_f1_x, home_f1_y), (home_f2_x, home_f2_y) = home_pos
+                                dist_f1 = math.sqrt((f1.x - home_f1_x)**2 + (f1.y - home_f1_y)**2)
+                                dist_f2 = math.sqrt((f2.x - home_f2_x)**2 + (f2.y - home_f2_y)**2)
+                                if dist_f1 <= HOME_ARRIVAL_THRESHOLD and dist_f2 <= HOME_ARRIVAL_THRESHOLD:
+                                    print(f"[VRP-HOME] Pair {pair_idx} arrived home, now RESERVE")
+                                    self._pair_assignments[pair_idx] = None
+                                    self._pair_targets[pair_idx] = None
+                                    f1.vx = f1.vy = 0
+                                    f2.vx = f2.vy = 0
+                                    f1.x, f1.y = home_f1_x, home_f1_y
+                                    f2.x, f2.y = home_f2_x, home_f2_y
+                                else:
+                                    f1.set_velocity_towards(home_f1_x, home_f1_y, CONFIG["friendly_speed"])
+                                    f2.set_velocity_towards(home_f2_x, home_f2_y, CONFIG["friendly_speed"])
+                            continue
+
+                        # === REASSIGNED PAIR (chasing missed/escaped enemy) ===
+                        if assigned_cluster_id is not None and assigned_cluster_id < 0:
+                            target_enemy = self._pair_targets.get(pair_idx)
+                            if target_enemy is not None and target_enemy.is_active:
+                                if int(self.sim_time * 10) % 50 == 0:
+                                    pair_center = ((f1.x + f2.x) / 2, (f1.y + f2.y) / 2)
+                                    dist = math.sqrt((target_enemy.x - pair_center[0])**2 + (target_enemy.y - pair_center[1])**2)
+                                    print(f"[VRP-CHASE] Reserve Pair {pair_idx} -> Enemy {target_enemy.id}, dist={dist:.0f}m")
+                                self._update_pair_direct_chase(f1, f2, target_enemy, net_spacing)
+                            else:
+                                # Target neutralized - return home
+                                print(f"[VRP-RETURN] Reserve Pair {pair_idx} mission complete, returning HOME")
+                                self._pair_assignments[pair_idx] = RETURNING_HOME_CLUSTER_ID
+                                self._pair_targets[pair_idx] = None
+                            continue
+
+                        # === NORMAL VRP ROUTE FOLLOWING ===
+                        route = self._pair_routes.get(pair_idx, [])
+                        route_idx = self._pair_route_index.get(pair_idx, 0)
+
+                        # Route completed or empty → return home
+                        if route_idx >= len(route):
+                            if assigned_cluster_id != RETURNING_HOME_CLUSTER_ID and assigned_cluster_id is not None:
+                                if route:
+                                    print(f"[VRP] Pair {pair_idx} completed all {len(route)} targets, returning HOME")
+                                self._pair_assignments[pair_idx] = RETURNING_HOME_CLUSTER_ID
+                                self._pair_targets[pair_idx] = None
+                            elif assigned_cluster_id is None:
+                                # Reserve pair (empty route) - stay stationary
+                                f1.vx = f1.vy = 0
+                                f2.vx = f2.vy = 0
+                            continue
+
+                        # Get current target from route
+                        target_enemy_id = route[route_idx]
+                        target_enemy = next(
+                            (e for e in self.enemies if e.id == target_enemy_id), None
+                        )
+
+                        # Target already neutralized → advance
+                        if target_enemy is None or not target_enemy.is_active:
+                            self._pair_route_index[pair_idx] = route_idx + 1
+                            self._pair_targets[pair_idx] = None
+                            continue
+
+                        # Chase current target
+                        self._pair_targets[pair_idx] = target_enemy
+                        self._update_pair_direct_chase(f1, f2, target_enemy, net_spacing)
+
+                    # === VRP: CHECK FOR MISSED ENEMIES AND DEPLOY RESERVES ===
+                    self._check_vrp_missed_enemies(pairs)
+
+                # === STATIC MODES (ortools, llm, scipy) - Skip for dynamic and VRP modes ===
+                if self._assignment_mode not in (AssignmentMode.ORTOOLS_DYNAMIC, AssignmentMode.ORTOOLS_VRP):
                     # Clean up targeted enemies set (remove dead enemies)
                     self._targeted_enemies = {
                         eid for eid in self._targeted_enemies
@@ -1522,15 +1816,48 @@ class MLSimulation:
                                         # Clear old target first
                                         self._pair_targets[pair_idx] = None
 
-                                        # Try to find a nearby enemy to chase
-                                        reassigned = self._check_post_capture_reassignment(
-                                            pair_idx, p1, p2, pairs
-                                        )
+                                        # === VRP MODE: Advance route index to next target ===
+                                        if self._assignment_mode == AssignmentMode.ORTOOLS_VRP:
+                                            vrp_assigned = self._pair_assignments.get(pair_idx)
 
-                                        if not reassigned:
-                                            # No nearby target - return to home position
-                                            self._pair_assignments[pair_idx] = RETURNING_HOME_CLUSTER_ID
-                                            print(f"[RETURN] Pair {pair_idx} captured Enemy {enemy.id}, returning to HOME position")
+                                            # Reserve pair (deployed to chase missed enemy) → return home
+                                            if vrp_assigned is not None and vrp_assigned < 0:
+                                                print(f"[VRP-RESERVE] Pair {pair_idx} captured missed Enemy {enemy.id}, returning HOME")
+                                                self._pair_assignments[pair_idx] = RETURNING_HOME_CLUSTER_ID
+                                            else:
+                                                # Normal VRP route pair → advance to next target
+                                                route = self._pair_routes.get(pair_idx, [])
+                                                old_idx = self._pair_route_index.get(pair_idx, 0)
+                                                new_idx = old_idx + 1
+                                                # Skip any already-dead enemies in route
+                                                while new_idx < len(route):
+                                                    next_e = next((e for e in self.enemies if e.id == route[new_idx]), None)
+                                                    if next_e and next_e.is_active:
+                                                        break
+                                                    new_idx += 1
+                                                self._pair_route_index[pair_idx] = new_idx
+
+                                                if new_idx < len(route):
+                                                    next_target_id = route[new_idx]
+                                                    next_target = next((e for e in self.enemies if e.id == next_target_id), None)
+                                                    if next_target and next_target.is_active:
+                                                        self._pair_targets[pair_idx] = next_target
+                                                        print(f"[VRP] Pair {pair_idx} captured Enemy {enemy.id}, advancing to next target: Enemy {next_target_id} ({new_idx+1}/{len(route)})")
+                                                    else:
+                                                        print(f"[VRP] Pair {pair_idx} captured Enemy {enemy.id}, route complete ({len(route)} targets done)")
+                                                else:
+                                                    print(f"[VRP] Pair {pair_idx} captured Enemy {enemy.id}, route complete ({len(route)} targets done)")
+                                        else:
+                                            # === STANDARD MODES: Post-capture reassignment ===
+                                            # Try to find a nearby enemy to chase
+                                            reassigned = self._check_post_capture_reassignment(
+                                                pair_idx, p1, p2, pairs
+                                            )
+
+                                            if not reassigned:
+                                                # No nearby target - return to home position
+                                                self._pair_assignments[pair_idx] = RETURNING_HOME_CLUSTER_ID
+                                                print(f"[RETURN] Pair {pair_idx} captured Enemy {enemy.id}, returning to HOME position")
                                         break
 
                                 print(f"[CAPTURE-POST] enemy.id={enemy.id}, neutralized_count={self.neutralized_count}, total={self.total_enemies}, remaining={self.total_enemies - self.neutralized_count}")
@@ -1813,9 +2140,9 @@ def main():
             print("Invalid choice, using Concentrated")
             pattern = AttackPattern.CONCENTRATED
 
-        enemies_input = input("Number of enemies (5-15) [default: 10]: ").strip()
-        num_enemies = int(enemies_input) if enemies_input else 10
-        num_enemies = max(5, min(15, num_enemies))
+        enemies_input = input("Number of enemies (5-30) [default: 15]: ").strip()
+        num_enemies = int(enemies_input) if enemies_input else 15
+        num_enemies = max(5, min(30, num_enemies))
 
         pairs_input = input("Number of friendly pairs (2-12) [default: 12]: ").strip()
         num_pairs = int(pairs_input) if pairs_input else 12
@@ -1824,18 +2151,21 @@ def main():
         print("\n【Assignment Mode Selection】")
         print("1. OR-Tools Static (default) - Lock assignment at 5km, fixed targets")
         print("2. OR-Tools Dynamic - Recalculate optimal assignment every 5 seconds")
-        print("3. LLM Tactical - Uses Ollama LLM for tactical reasoning")
-        print("4. Scipy Hungarian - Fallback mode using scipy")
+        print("3. OR-Tools VRP - Multi-target routes (enemies > pairs supported)")
+        print("4. LLM Tactical - Uses Ollama LLM for tactical reasoning")
+        print("5. Scipy Hungarian - Fallback mode using scipy")
         print("-" * 40)
 
-        mode_input = input("Select assignment mode (1-4) [default: 1]: ").strip()
+        mode_input = input("Select assignment mode (1-5) [default: 1]: ").strip()
         if mode_input == "" or mode_input == "1":
             assignment_mode = AssignmentMode.ORTOOLS
         elif mode_input == "2":
             assignment_mode = AssignmentMode.ORTOOLS_DYNAMIC
         elif mode_input == "3":
-            assignment_mode = AssignmentMode.LLM
+            assignment_mode = AssignmentMode.ORTOOLS_VRP
         elif mode_input == "4":
+            assignment_mode = AssignmentMode.LLM
+        elif mode_input == "5":
             assignment_mode = AssignmentMode.SCIPY
         else:
             print("Invalid choice, using OR-Tools Static")
@@ -1851,6 +2181,12 @@ def main():
             print("  - Recalculates optimal pair-enemy assignment every 3 seconds")
             print("  - Pairs switch targets dynamically for best efficiency")
             print("  - Uses effective distance: distance + |angle| × 1.5")
+        elif assignment_mode == AssignmentMode.ORTOOLS_VRP:
+            print("\n【OR-Tools VRP Mode (Vehicle Routing Problem)】")
+            print("  - Each pair gets a ROUTE: sequential list of enemies to neutralize")
+            print("  - Handles enemies > pairs by assigning multiple targets per pair")
+            print("  - Minimizes total travel cost across all pairs from the start")
+            print("  - After neutralizing one enemy, immediately moves to next in route")
         elif assignment_mode == AssignmentMode.LLM:
             print("\n【LLM Mode】")
             print("  - Recommended model: qwen2.5:7b-instruct (via Ollama)")
@@ -1870,6 +2206,7 @@ def main():
     mode_label = {
         AssignmentMode.ORTOOLS: "OR-Tools Static",
         AssignmentMode.ORTOOLS_DYNAMIC: "OR-Tools Dynamic",
+        AssignmentMode.ORTOOLS_VRP: "OR-Tools VRP (Multi-Target Routes)",
         AssignmentMode.LLM: "LLM Tactical",
         AssignmentMode.SCIPY: "Scipy Hungarian",
     }.get(assignment_mode, assignment_mode)

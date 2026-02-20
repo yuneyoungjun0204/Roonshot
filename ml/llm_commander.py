@@ -18,7 +18,18 @@ import math
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 
-from ml.constants import DEFENSE_CENTER
+from ml.constants import (
+    DEFENSE_CENTER,
+    ANGLE_WEIGHT,
+    ETA_WEIGHT_DEFAULT,
+    ETA_WEIGHT_WAVE,
+    ETA_MAX,
+    ETA_PENALTY_SCALE,
+    LLM_DEFAULT_MODEL,
+    LLM_OLLAMA_BASE_URL,
+    LLM_TEMPERATURE,
+    COST_MATRIX_BIG,
+)
 from ml.labels import FormationClass
 from ml.naval_doctrine_v2 import (
     DOCTRINE_CHUNKS_V2,

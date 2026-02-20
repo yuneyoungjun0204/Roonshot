@@ -19,7 +19,17 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 
-from ml.constants import DEFENSE_CENTER
+from ml.constants import (
+    DEFENSE_CENTER,
+    ANGLE_WEIGHT,
+    ETA_WEIGHT_DEFAULT,
+    ETA_WEIGHT_WAVE,
+    ETA_MAX,
+    ETA_PENALTY_SCALE,
+    COST_MATRIX_BIG,
+    VRP_BIG_DISTANCE,
+    VRP_TIME_LIMIT_SECONDS,
+)
 from ml.labels import FormationClass
 
 
@@ -32,11 +42,23 @@ class AssignmentResult:
     reasoning: str  # Human-readable explanation
 
 
+@dataclass
+class VRPAssignmentResult:
+    """Result of OR-Tools VRP (Vehicle Routing Problem) optimization.
+
+    Each pair gets a ROUTE (ordered list of enemies to neutralize sequentially).
+    This solves the case where enemies outnumber friendly pairs.
+    """
+    pair_routes: Dict[int, List[int]]  # pair_id -> [enemy_id_1, enemy_id_2, ...]
+    total_cost: float  # Total travel cost across all routes
+    reasoning: str  # Human-readable explanation
+
+
 def calculate_effective_distance(
     pair_pos: Tuple[float, float],
     pair_heading_deg: float,
     cluster_center: Tuple[float, float],
-    angle_weight: float = 1.5,
+    angle_weight: float = ANGLE_WEIGHT,
 ) -> float:
     """
     Calculate effective distance using naval doctrine v2 formula.
@@ -80,7 +102,7 @@ def calculate_eta_factor(
     cluster_center: Tuple[float, float],
     cluster_velocity: Tuple[float, float],
     defense_center: Tuple[float, float] = DEFENSE_CENTER,
-    max_eta: float = 200.0,
+    max_eta: float = ETA_MAX,
 ) -> float:
     """
     Calculate ETA-based priority factor.
@@ -120,7 +142,7 @@ def build_cost_matrix(
     clusters: List[Dict],
     formation: FormationClass,
     defense_center: Tuple[float, float] = DEFENSE_CENTER,
-    angle_weight: float = 1.5,
+    angle_weight: float = ANGLE_WEIGHT,
     eta_weight: float = 0.2,
 ) -> np.ndarray:
     """
@@ -170,7 +192,7 @@ def build_cost_matrix(
                 center, velocity, defense_center
             )
             # Convert to penalty: lower ETA = lower penalty
-            eta_penalty = (1.0 - eta_factor) * 500  # Scale to distance units
+            eta_penalty = (1.0 - eta_factor) * ETA_PENALTY_SCALE  # Scale to distance units
 
             # Combined cost
             cost_matrix[i, j] = eff_dist + eta_weight * eta_penalty
@@ -217,7 +239,7 @@ def ortools_optimal_assignment(
 
     # Pad to square matrix if needed
     size = max(n_agents, n_clusters)
-    padded_cost = np.full((size, size), 1e9)
+    padded_cost = np.full((size, size), COST_MATRIX_BIG)
     padded_cost[:n_agents, :n_clusters] = cost_matrix
 
     try:
@@ -327,7 +349,7 @@ def scipy_optimal_assignment(
 
     # Pad to square matrix if needed
     size = max(n_agents, n_clusters)
-    padded_cost = np.full((size, size), 1e9)
+    padded_cost = np.full((size, size), COST_MATRIX_BIG)
     padded_cost[:n_agents, :n_clusters] = cost_matrix
 
     # Hungarian algorithm
@@ -413,6 +435,7 @@ class AssignmentMode:
     """Assignment mode enumeration."""
     ORTOOLS = "ortools"              # Static: Lock assignment at 5km, never change
     ORTOOLS_DYNAMIC = "ortools_dynamic"  # Dynamic: Recalculate optimal assignment every frame
+    ORTOOLS_VRP = "ortools_vrp"      # VRP: Multi-target routes when enemies > pairs
     LLM = "llm"
     SCIPY = "scipy"  # Fallback only
 
@@ -425,7 +448,8 @@ def get_tactical_assignment(
     mode: str = AssignmentMode.ORTOOLS,
     model_name: str = "qwen2.5:7b-instruct",
     defense_center: Tuple[float, float] = DEFENSE_CENTER,
-) -> Tuple[Dict[int, int], str]:
+    enemies: Optional[List[Dict]] = None,
+) -> Tuple[Dict, str]:
     """
     Unified tactical assignment function supporting multiple modes.
 
@@ -434,17 +458,41 @@ def get_tactical_assignment(
         clusters: List of cluster dicts with 'cluster_id', 'center', 'velocity'
         formation: Formation type
         confidence: Formation classification confidence
-        mode: Assignment mode ('ortools', 'llm', 'scipy')
+        mode: Assignment mode ('ortools', 'ortools_vrp', 'llm', 'scipy')
         model_name: LLM model name (only used in LLM mode)
         defense_center: Defense center position
+        enemies: List of enemy dicts (required for VRP mode)
 
     Returns:
-        Tuple of (assignments dict, reasoning string)
+        For standard modes: Tuple of (assignments dict {pair_id: cluster_id}, reasoning)
+        For VRP mode: Tuple of (VRPAssignmentResult, reasoning)
     """
     if mode == AssignmentMode.ORTOOLS:
         return get_optimal_assignment(
             agents, clusters, formation, confidence, defense_center
         )
+    elif mode == AssignmentMode.ORTOOLS_VRP:
+        if enemies is None:
+            print("[Warning] VRP mode requires enemies list, falling back to OR-Tools")
+            return get_optimal_assignment(
+                agents, clusters, formation, confidence, defense_center
+            )
+        result = ortools_vrp_assignment(
+            agents, enemies, formation, defense_center
+        )
+        # Log VRP assignment details
+        print("\n" + "=" * 50)
+        print("【OR-Tools VRP Assignment (Multi-Target Routes)】")
+        print("=" * 50)
+        print(f"Formation: {formation.name} (Confidence: {confidence:.1%})")
+        print(f"Agents: {len(agents)}, Enemies: {len(enemies)}")
+        print(f"Total Cost: {result.total_cost:.1f}")
+        print("-" * 40)
+        print("Routes:")
+        for pair_id, route in sorted(result.pair_routes.items()):
+            print(f"  Pair {pair_id} -> Enemies {route} ({len(route)} targets)")
+        print("=" * 50 + "\n")
+        return result, result.reasoning
     elif mode == AssignmentMode.LLM:
         # Import LLM commander only when needed
         from ml.llm_commander import get_tactical_command
@@ -528,20 +576,20 @@ def compute_dynamic_assignment(
 
             # Effective distance (primary cost)
             eff_dist = calculate_effective_distance(
-                pos, heading, enemy_pos, angle_weight=1.5
+                pos, heading, enemy_pos, angle_weight=ANGLE_WEIGHT
             )
 
             # ETA factor (secondary cost)
             eta_factor = calculate_eta_factor(
                 enemy_pos, enemy_vel, defense_center
             )
-            eta_penalty = (1.0 - eta_factor) * 500
+            eta_penalty = (1.0 - eta_factor) * ETA_PENALTY_SCALE
 
             cost_matrix[i, j] = eff_dist + eta_weight * eta_penalty
 
     # Pad to square matrix
     size = max(n_agents, n_enemies)
-    padded_cost = np.full((size, size), 1e9)
+    padded_cost = np.full((size, size), COST_MATRIX_BIG)
     padded_cost[:n_agents, :n_enemies] = cost_matrix
 
     # Solve using scipy (faster for frequent calls)
@@ -615,4 +663,341 @@ def get_dynamic_assignment(
     return compute_dynamic_assignment(
         agents, enemy_dicts, formation, defense_center,
         previous_assignments, verbose
+    )
+
+
+# =============================================================================
+# VRP (Vehicle Routing Problem) ASSIGNMENT
+# =============================================================================
+# Solves the case where enemies outnumber friendly pairs.
+# Each pair gets an ordered ROUTE of enemies to neutralize sequentially.
+
+def _build_vrp_distance_matrix(
+    agents: List[Dict],
+    enemies: List[Dict],
+    formation: FormationClass,
+    defense_center: Tuple[float, float] = DEFENSE_CENTER,
+    angle_weight: float = ANGLE_WEIGHT,
+) -> List[List[int]]:
+    """
+    Build distance matrix for VRP solver.
+
+    Node layout:
+      [0, n_pairs)                      : pair start positions
+      [n_pairs, n_pairs + n_enemies)    : enemy positions
+      [n_pairs + n_enemies]             : dummy end node
+
+    Returns:
+        Integer distance matrix (OR-Tools routing requires int costs)
+    """
+    n_pairs = len(agents)
+    n_enemies = len(enemies)
+    total_nodes = n_pairs + n_enemies + 1  # +1 for dummy end
+    dummy_end = total_nodes - 1
+
+    # ETA weight based on formation
+    if formation == FormationClass.WAVE:
+        eta_weight = 0.4
+    else:
+        eta_weight = 0.2
+
+    # Initialize with large values
+    BIG = VRP_BIG_DISTANCE
+    dist_matrix = [[BIG] * total_nodes for _ in range(total_nodes)]
+
+    # Diagonal = 0
+    for i in range(total_nodes):
+        dist_matrix[i][i] = 0
+
+    # 1. pair_i -> enemy_j : effective distance + ETA penalty
+    for i, agent in enumerate(agents):
+        pos = tuple(agent['pos'])
+        heading = agent['angle']
+        for j, enemy in enumerate(enemies):
+            enemy_pos = tuple(enemy['pos'])
+            enemy_vel = tuple(enemy.get('velocity', (0, 0)))
+
+            eff_dist = calculate_effective_distance(
+                pos, heading, enemy_pos, angle_weight
+            )
+            eta_factor = calculate_eta_factor(
+                enemy_pos, enemy_vel, defense_center
+            )
+            eta_penalty = (1.0 - eta_factor) * ETA_PENALTY_SCALE
+            cost = eff_dist + eta_weight * eta_penalty
+
+            enemy_node = n_pairs + j
+            dist_matrix[i][enemy_node] = int(cost)
+
+    # 2. enemy_i -> enemy_j : euclidean distance + ETA penalty of target
+    for i, enemy_i in enumerate(enemies):
+        pos_i = enemy_i['pos']
+        for j, enemy_j in enumerate(enemies):
+            if i == j:
+                continue
+            pos_j = enemy_j['pos']
+            vel_j = enemy_j.get('velocity', (0, 0))
+
+            dx = pos_j[0] - pos_i[0]
+            dy = pos_j[1] - pos_i[1]
+            eucl_dist = math.sqrt(dx * dx + dy * dy)
+
+            eta_factor = calculate_eta_factor(
+                tuple(pos_j), tuple(vel_j), defense_center
+            )
+            eta_penalty = (1.0 - eta_factor) * ETA_PENALTY_SCALE
+            cost = eucl_dist + eta_weight * eta_penalty
+
+            node_i = n_pairs + i
+            node_j = n_pairs + j
+            dist_matrix[node_i][node_j] = int(cost)
+
+    # 3. any -> dummy_end = 0 (free termination)
+    for i in range(total_nodes):
+        dist_matrix[i][dummy_end] = 0
+
+    # 4. dummy_end -> any = BIG (cannot start from dummy)
+    for j in range(total_nodes):
+        dist_matrix[dummy_end][j] = BIG
+    dist_matrix[dummy_end][dummy_end] = 0
+
+    # 5. enemy -> pair_start = BIG (no need to visit other pair starts)
+    for i in range(n_enemies):
+        for j in range(n_pairs):
+            dist_matrix[n_pairs + i][j] = BIG
+
+    # 6. pair_start -> pair_start = BIG
+    for i in range(n_pairs):
+        for j in range(n_pairs):
+            if i != j:
+                dist_matrix[i][j] = BIG
+
+    return dist_matrix
+
+
+def ortools_vrp_assignment(
+    agents: List[Dict],
+    enemies: List[Dict],
+    formation: FormationClass = FormationClass.DIVERSIONARY,
+    defense_center: Tuple[float, float] = DEFENSE_CENTER,
+    time_limit_seconds: int = VRP_TIME_LIMIT_SECONDS,
+) -> VRPAssignmentResult:
+    """
+    Compute optimal multi-target routes using OR-Tools VRP solver.
+
+    Each friendly pair gets an ordered list of enemies to neutralize.
+    The solver minimizes total travel cost across all pairs.
+
+    This handles the case where enemies > friendly pairs by assigning
+    multiple enemies per pair as a sequential route.
+
+    Args:
+        agents: List of agent dicts with 'id', 'pos', 'angle'
+        enemies: List of enemy dicts with 'id', 'pos', 'velocity'
+        formation: Formation type for ETA weighting
+        defense_center: Defense center position
+        time_limit_seconds: Solver time limit
+
+    Returns:
+        VRPAssignmentResult with optimal routes per pair
+    """
+    if not agents or not enemies:
+        return VRPAssignmentResult(
+            pair_routes={},
+            total_cost=0.0,
+            reasoning="No agents or enemies to assign",
+        )
+
+    n_pairs = len(agents)
+    n_enemies = len(enemies)
+    total_nodes = n_pairs + n_enemies + 1
+    dummy_end = total_nodes - 1
+
+    # Build distance matrix
+    dist_matrix = _build_vrp_distance_matrix(
+        agents, enemies, formation, defense_center
+    )
+
+    try:
+        from ortools.constraint_solver import routing_enums_pb2, pywrapcp
+
+        # Create routing index manager
+        starts = list(range(n_pairs))  # Each pair starts at its own node
+        ends = [dummy_end] * n_pairs   # All end at dummy node
+
+        manager = pywrapcp.RoutingIndexManager(
+            total_nodes,
+            n_pairs,
+            starts,
+            ends,
+        )
+
+        routing = pywrapcp.RoutingModel(manager)
+
+        # Distance callback
+        def distance_callback(from_index, to_index):
+            from_node = manager.IndexToNode(from_index)
+            to_node = manager.IndexToNode(to_index)
+            return dist_matrix[from_node][to_node]
+
+        transit_callback_index = routing.RegisterTransitCallback(distance_callback)
+        routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+
+        # Capacity constraint: balance enemy count across pairs
+        # Each enemy "demands" 1 unit of capacity, start/end nodes demand 0
+        def demand_callback(from_index):
+            node = manager.IndexToNode(from_index)
+            if n_pairs <= node < n_pairs + n_enemies:
+                return 1  # Enemy node
+            return 0  # Pair start or dummy end
+
+        demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
+
+        # Max enemies per pair: ceil(n_enemies / n_pairs) + 1 buffer
+        max_per_pair = (n_enemies + n_pairs - 1) // n_pairs + 1
+
+        routing.AddDimensionWithVehicleCapacity(
+            demand_callback_index,
+            0,  # no slack
+            [max_per_pair] * n_pairs,  # max capacity per vehicle
+            True,  # start cumul to zero
+            'Capacity',
+        )
+
+        # Search parameters
+        search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+        search_parameters.first_solution_strategy = (
+            routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+        )
+        search_parameters.local_search_metaheuristic = (
+            routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        )
+        search_parameters.time_limit.seconds = time_limit_seconds
+
+        # Solve
+        solution = routing.SolveWithParameters(search_parameters)
+
+        if solution:
+            pair_routes = {}
+            total_cost = 0
+
+            for vehicle_id in range(n_pairs):
+                pair_id = agents[vehicle_id]['id']
+                route = []
+                index = routing.Start(vehicle_id)
+
+                while not routing.IsEnd(index):
+                    node = manager.IndexToNode(index)
+                    next_index = solution.Value(routing.NextVar(index))
+                    total_cost += routing.GetArcCostForVehicle(
+                        index, next_index, vehicle_id
+                    )
+
+                    # Collect enemy nodes in route
+                    if n_pairs <= node < n_pairs + n_enemies:
+                        enemy_idx = node - n_pairs
+                        route.append(enemies[enemy_idx]['id'])
+
+                    index = next_index
+
+                pair_routes[pair_id] = route
+
+            reasoning = (
+                f"OR-Tools VRP: {n_pairs} pairs routing through {n_enemies} enemies. "
+                f"Total cost: {total_cost}. "
+                f"Routes: {', '.join(f'P{pid}→{len(r)} targets' for pid, r in pair_routes.items())}"
+            )
+
+            return VRPAssignmentResult(
+                pair_routes=pair_routes,
+                total_cost=float(total_cost),
+                reasoning=reasoning,
+            )
+        else:
+            raise Exception("VRP solver found no solution")
+
+    except ImportError:
+        print("[VRP] OR-Tools routing not available, using greedy fallback")
+        return greedy_vrp_fallback(agents, enemies, formation, defense_center)
+    except Exception as e:
+        print(f"[VRP] OR-Tools VRP solver failed: {e}, using greedy fallback")
+        return greedy_vrp_fallback(agents, enemies, formation, defense_center)
+
+
+def greedy_vrp_fallback(
+    agents: List[Dict],
+    enemies: List[Dict],
+    formation: FormationClass = FormationClass.DIVERSIONARY,
+    defense_center: Tuple[float, float] = DEFENSE_CENTER,
+) -> VRPAssignmentResult:
+    """
+    Greedy fallback for VRP when OR-Tools is not available.
+
+    Strategy:
+    1. Sort enemies by ETA (most urgent first)
+    2. For each enemy, assign to the pair with lowest effective distance
+       considering the pair's last assigned position
+    3. Build routes per pair using nearest-neighbor heuristic
+    """
+    if not agents or not enemies:
+        return VRPAssignmentResult(
+            pair_routes={},
+            total_cost=0.0,
+            reasoning="No agents or enemies to assign",
+        )
+
+    n_pairs = len(agents)
+    n_enemies = len(enemies)
+
+    # ETA weight
+    eta_weight = 0.4 if formation == FormationClass.WAVE else 0.2
+
+    # Sort enemies by ETA (shortest first = most urgent)
+    enemy_etas = []
+    for e in enemies:
+        eta_factor = calculate_eta_factor(
+            tuple(e['pos']), tuple(e.get('velocity', (0, 0))), defense_center
+        )
+        enemy_etas.append((e, eta_factor))
+    enemy_etas.sort(key=lambda x: -x[1])  # Higher eta_factor = shorter ETA = more urgent
+
+    # Track current position for each pair (starts at pair position)
+    pair_current_pos = {i: tuple(agents[i]['pos']) for i in range(n_pairs)}
+    pair_routes: Dict[int, List[int]] = {agents[i]['id']: [] for i in range(n_pairs)}
+    total_cost = 0.0
+
+    # Assign each enemy to the cheapest pair
+    for enemy, eta_factor in enemy_etas:
+        enemy_pos = tuple(enemy['pos'])
+        best_pair_idx = None
+        best_cost = float('inf')
+
+        for i in range(n_pairs):
+            cur_pos = pair_current_pos[i]
+            dx = enemy_pos[0] - cur_pos[0]
+            dy = enemy_pos[1] - cur_pos[1]
+            dist = math.sqrt(dx * dx + dy * dy)
+            eta_penalty = (1.0 - eta_factor) * ETA_PENALTY_SCALE
+            cost = dist + eta_weight * eta_penalty
+
+            if cost < best_cost:
+                best_cost = cost
+                best_pair_idx = i
+
+        if best_pair_idx is not None:
+            pair_id = agents[best_pair_idx]['id']
+            pair_routes[pair_id].append(enemy['id'])
+            pair_current_pos[best_pair_idx] = enemy_pos
+            total_cost += best_cost
+
+    reasoning = (
+        f"Greedy VRP fallback: {n_pairs} pairs routing through {n_enemies} enemies. "
+        f"Total cost: {total_cost:.1f}. "
+        f"Routes: {', '.join(f'P{pid}→{len(r)} targets' for pid, r in pair_routes.items())}"
+    )
+
+    return VRPAssignmentResult(
+        pair_routes=pair_routes,
+        total_cost=total_cost,
+        reasoning=reasoning,
     )

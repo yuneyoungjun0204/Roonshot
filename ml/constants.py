@@ -1,141 +1,104 @@
 """
 Constants and thresholds for the ML formation classification system.
+
+All values are imported from the centralized PARAM.py file.
+This module re-exports them for backward compatibility with existing ml/* imports.
 """
 
-# =============================================================================
-# DEFENSE GEOMETRY
-# =============================================================================
-DEFENSE_CENTER = (9000.0, 9000.0)
-WORLD_SIZE = 18000.0
+import sys
+import os
 
-# =============================================================================
-# FORMATION CLASSIFICATION THRESHOLDS
-# =============================================================================
-# Angular spread thresholds (in degrees)
-SPEARHEAD_ANGLE_THRESHOLD = 30.0    # < 30° → narrow approach (CONCENTRATED or WAVE)
+# Ensure project root is on the path so we can import PARAM
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Distance std threshold (meters) — separates CONCENTRATED from WAVE
-# Both have narrow angle, but WAVE has layered distances (sequential waves)
-WAVE_DISTANCE_STD_THRESHOLD = 400.0  # distance_std >= 400m within narrow angle → WAVE
+from PARAM import (
+    # Defense Geometry
+    DEFENSE_CENTER,
+    WORLD_SIZE,
 
-# Legacy constants (kept for reference)
-ENCIRCLEMENT_ANGLE_THRESHOLD = 60.0
-ENCIRCLEMENT_ETA_STD_THRESHOLD = 15.0
+    # Formation Classification Thresholds
+    SPEARHEAD_ANGLE_THRESHOLD,
+    WAVE_DISTANCE_STD_THRESHOLD,
+    ENCIRCLEMENT_ANGLE_THRESHOLD,
+    ENCIRCLEMENT_ETA_STD_THRESHOLD,
+    MIN_ENEMIES_FOR_ML,
+    FORMATION_LOCK_RADIUS,
 
-# Minimum active enemies for ML classification
-MIN_ENEMIES_FOR_ML = 3  # Below this, fall back to rule-based
+    # Feature Extraction
+    NUM_FEATURES,
+    FEATURE_NAMES,
 
-# Formation lock: classify once when first enemy enters this radius
-FORMATION_LOCK_RADIUS = 5000.0  # meters from defense center
+    # DBSCAN Density Analysis
+    DBSCAN_EPS,
+    DBSCAN_MIN_SAMPLES,
+    NET_SPACING_BASE,
+    NET_SPACING_MIN,
+    NET_SPACING_MAX,
+    MAX_PAIRS_PER_CLUSTER,
+    MIN_PAIRS_PER_CLUSTER,
+    TOTAL_FRIENDLY_PAIRS,
+    DENSITY_HIGH_THRESHOLD,
+    DENSITY_LOW_THRESHOLD,
 
-# =============================================================================
-# FEATURE EXTRACTION
-# =============================================================================
-NUM_FEATURES = 19
-FEATURE_NAMES = [
-    # Angular distribution (f1-f4)
-    "mean_bearing",
-    "angular_std",
-    "angular_range",
-    "num_quadrants",
-    # Distance distribution (f5-f8)
-    "mean_distance",
-    "distance_std",
-    "min_distance",
-    "max_distance",
-    # Speed consistency (f9-f12)
-    "mean_approach_speed",
-    "speed_std",
-    "heading_alignment",
-    "alignment_std",
-    # Time consistency (f13-f15)
-    "mean_eta",
-    "eta_std",
-    "min_eta",
-    # Density (f16-f18)
-    "mean_pairwise_distance",
-    "pairwise_distance_std",
-    "mean_nn_distance",
-    # Other (f19)
-    "num_active_enemies",
-]
+    # Classifier Model
+    CLASSIFIER_INPUT_DIM,
+    CLASSIFIER_HIDDEN1,
+    CLASSIFIER_HIDDEN2,
+    CLASSIFIER_OUTPUT_DIM,
+    LEARNING_RATE,
+    BATCH_SIZE,
+    MAX_EPOCHS,
+    EARLY_STOPPING_PATIENCE,
+    CONFIDENCE_THRESHOLD,
 
-# =============================================================================
-# DBSCAN DENSITY ANALYSIS
-# =============================================================================
-DBSCAN_EPS = 150.0          # meters - neighborhood radius
-DBSCAN_MIN_SAMPLES = 1      # minimum cluster size
+    # Missed Enemy Detection
+    MISSED_THRESHOLD,
 
-# Net spacing parameters
-NET_SPACING_BASE = 80.0      # meters - base net spacing
-NET_SPACING_MIN = 40.0       # meters - minimum net spacing (dense cluster)
-NET_SPACING_MAX = 100.0      # meters - maximum net spacing (sparse cluster)
+    # Escaped Enemy Detection
+    ESCAPE_DISTANCE_THRESHOLD,
 
-# Pair allocation
-MAX_PAIRS_PER_CLUSTER = 3
-MIN_PAIRS_PER_CLUSTER = 1
-TOTAL_FRIENDLY_PAIRS = 5
+    # Pair Return to Home
+    RETURNING_HOME_CLUSTER_ID,
+    HOME_ARRIVAL_THRESHOLD,
 
-# Density thresholds for pair allocation
-DENSITY_HIGH_THRESHOLD = 1000.0    # mean NN < 400m → high density → 3 pairs
-DENSITY_LOW_THRESHOLD = 2500.0    # mean NN > 1200m → low density → 1 pair
+    # Post-Capture Reassignment
+    POST_CAPTURE_DISTANCE_THRESHOLD,
+    POST_CAPTURE_ANGLE_THRESHOLD,
 
-# =============================================================================
-# CLASSIFIER MODEL
-# =============================================================================
-CLASSIFIER_INPUT_DIM = 19
-CLASSIFIER_HIDDEN1 = 64
-CLASSIFIER_HIDDEN2 = 32
-CLASSIFIER_OUTPUT_DIM = 3  # CONCENTRATED (집중), WAVE (파상), DIVERSIONARY (양동)
+    # Tactical Assignment
+    ANGLE_WEIGHT,
+    ETA_WEIGHT_DEFAULT,
+    ETA_WEIGHT_WAVE,
+    ETA_MAX,
+    ETA_PENALTY_SCALE,
+    COST_MATRIX_BIG,
 
-# Training hyperparameters
-LEARNING_RATE = 1e-3
-BATCH_SIZE = 64
-MAX_EPOCHS = 500                  # Increased from 200 for better convergence
-EARLY_STOPPING_PATIENCE = 40     # Increased from 15 to allow more exploration
+    # VRP Solver
+    VRP_TIME_LIMIT_SECONDS,
+    VRP_BIG_DISTANCE,
 
-# Confidence threshold for rule-based fallback
-CONFIDENCE_THRESHOLD = 0.6
+    # Classifier Dropout
+    CLASSIFIER_DROPOUT1,
+    CLASSIFIER_DROPOUT2,
 
-# =============================================================================
-# MISSED ENEMY DETECTION
-# =============================================================================
-MISSED_THRESHOLD = 100.0  # meters - enemy must be this much closer to mothership than pair to be "missed"
+    # LLM Commander
+    LLM_DEFAULT_MODEL,
+    LLM_OLLAMA_BASE_URL,
+    LLM_TEMPERATURE,
 
-# =============================================================================
-# ESCAPED ENEMY DETECTION
-# =============================================================================
-# An enemy is "escaped" from its cluster if it moves beyond this distance from the cluster center
-ESCAPE_DISTANCE_THRESHOLD = 800.0  # meters - distance from cluster center to be considered "escaped"
+    # Data Augmentation
+    AUGMENT_NOISE_STD,
+    AUGMENT_TEMPORAL_STEPS,
+    AUGMENT_TEMPORAL_RANGE,
+    AUGMENT_ROTATION_ENABLED,
+    AUGMENT_SCALE_RANGE,
+)
 
-# =============================================================================
-# PAIR RETURN TO HOME
-# =============================================================================
-# Virtual cluster ID to indicate "returning to home position" state
-RETURNING_HOME_CLUSTER_ID = -99999  # Special marker for returning state
-HOME_ARRIVAL_THRESHOLD = 50.0  # meters - distance to home position to be considered "arrived"
-
-# =============================================================================
-# POST-CAPTURE REASSIGNMENT
-# =============================================================================
-# After capturing an enemy, check if nearby enemies can be chased instead of returning home
-POST_CAPTURE_DISTANCE_THRESHOLD = 150.0  # meters - enemy must be within this distance to be considered
-POST_CAPTURE_ANGLE_THRESHOLD = 30.0  # degrees - enemy must be within this angle range from pair heading
-
-# =============================================================================
-# DATA AUGMENTATION
-# =============================================================================
-AUGMENT_NOISE_STD = 0.05          # Gaussian noise std (fraction of feature std)
-AUGMENT_TEMPORAL_STEPS = 3        # Number of temporal snapshots around lock point
-AUGMENT_TEMPORAL_RANGE = 20       # Simulation steps before/after lock (±20 steps)
-AUGMENT_ROTATION_ENABLED = True   # Enable random rotation augmentation
-AUGMENT_SCALE_RANGE = (0.9, 1.1)  # Scale factor range for position augmentation
-
-# =============================================================================
-# DATA GENERATION
-# =============================================================================
-ENEMY_SPEED = 100.0          # m/s (3x increased)
-FRIENDLY_SPEED = 50.0        # m/s (3x increased)
-SPAWN_RADIUS_BASE = 7500.0   # meters from center (CONCENTRATED / DIVERSIONARY) — matches simulator safe_zone_radii[-1]+500
-WAVE_SPAWN_RADIUS = 7000.0   # meters from center (WAVE 1st wave) — matches simulator hardcoded value
-DT = 0.05                    # simulation timestep
+# Data Generation - re-export with original names for backward compatibility
+from PARAM import (
+    DATA_GEN_ENEMY_SPEED as ENEMY_SPEED,
+    DATA_GEN_FRIENDLY_SPEED as FRIENDLY_SPEED,
+    DATA_GEN_SPAWN_RADIUS_BASE as SPAWN_RADIUS_BASE,
+    DATA_GEN_WAVE_SPAWN_RADIUS as WAVE_SPAWN_RADIUS,
+    DATA_GEN_DT as DT,
+)

@@ -19,6 +19,8 @@ from ml.constants import (
     CLASSIFIER_HIDDEN2,
     CLASSIFIER_OUTPUT_DIM,
     CONFIDENCE_THRESHOLD,
+    CLASSIFIER_DROPOUT1,
+    CLASSIFIER_DROPOUT2,
 )
 from ml.labels import FormationClass
 
@@ -38,11 +40,11 @@ class FormationClassifier(nn.Module):
             nn.Linear(input_dim, hidden1),
             nn.ReLU(),
             nn.BatchNorm1d(hidden1),
-            nn.Dropout(0.2),
+            nn.Dropout(CLASSIFIER_DROPOUT1),
             nn.Linear(hidden1, hidden2),
             nn.ReLU(),
             nn.BatchNorm1d(hidden2),
-            nn.Dropout(0.1),
+            nn.Dropout(CLASSIFIER_DROPOUT2),
             nn.Linear(hidden2, output_dim),
         )
         # StandardScaler parameters (set after training or loading)

@@ -18,47 +18,9 @@ from enum import Enum
 import time
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION (centralized in PARAM.py)
 # =============================================================================
-CONFIG = {
-    # Simulation
-    "dt": 0.05,  # Time step (seconds)
-    "max_time": 300,  # Max simulation time (seconds)
-
-    # Display
-    "screen_width": 1600,
-    "screen_height": 1200,
-    "world_size": 18000,  # 18km x 18km simulation world
-    "view_radius": 9000,  # visible radius from defense center (9km viewport)
-
-    # Colors (Dark Theme)
-    "bg_color": (15, 15, 25),
-    "grid_color": (30, 30, 50),
-    "friendly_color": (0, 200, 255),
-    "enemy_color": (255, 80, 80),
-    "net_color": (100, 255, 150),
-    "captured_color": (255, 200, 0),
-    "safe_zone_1km": (50, 50, 80, 80),
-    "safe_zone_2km": (40, 40, 70, 60),
-    "text_color": (220, 220, 240),
-    "ui_bg_color": (25, 25, 40, 200),
-
-    # USV Parameters
-    "friendly_speed": 75.0,  # m/s (3x increased)
-    "enemy_speed": 150.0,  # m/s (high-speed threat, 3x increased)
-    "capture_distance": 15.0,  # meters - net capture threshold
-    "net_max_length": 200.0,  # meters - maximum net extension
-
-    # Defense Zone
-    "defense_center": (9000, 9000),  # Center of defense (meters)
-    "safe_zone_radii": [1000, 2000, 3000, 4000, 5000, 6000, 7000],  # 1km ~ 7km radii
-
-    # Mothership
-    "mothership_size": 200.0,  # meters (square side length)
-    "mothership_color": (150, 150, 200),
-    "mothership_position": (9000, 9000),  # Position at defense center
-    "mothership_collision_distance": 100.0,  # 0.4km = 400m collision detection radius
-}
+from PARAM import CONFIG
 
 
 class AttackPattern(Enum):
