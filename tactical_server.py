@@ -168,7 +168,7 @@ class TacticalServer:
             labels = np.full(len(enemy_positions), -1, dtype=int)
             centers = {}
             for cm in decision.cluster_metrics:
-                for idx in cm.member_indices:
+                for idx in cm.enemy_indices:
                     if idx < len(labels):
                         labels[idx] = cm.cluster_id
                 centers[cm.cluster_id] = (cm.center[0], cm.center[1])

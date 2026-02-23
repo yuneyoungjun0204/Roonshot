@@ -125,9 +125,10 @@ class UnityVisualizer:
                 if event.key == pygame.K_f:
                     self._auto_fit = not self._auto_fit
 
-        # 뷰포트 자동 조정
-        if state:
+        # 뷰포트: 첫 프레임에서만 자동 조정 후 고정
+        if state and self._auto_fit:
             self._auto_fit_view(state)
+            self._auto_fit = False  # 첫 프레임 이후 고정
 
         # 배경
         self.screen.fill(self.COLOR_BG)
